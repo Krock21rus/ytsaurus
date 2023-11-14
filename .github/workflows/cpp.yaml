@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - stable/[0-9]+\.[0-9]+
+      - gh_actions_odin
 
 jobs:
   start-vm:
