@@ -20,7 +20,7 @@ pip3 install -r "${SOURCE_ROOT}/yt/odin/tests/requirements.txt"
 
 export PYTHONPATH="$PYTHON_ROOT"
 export YT_BUILD_ROOT="${BUILD_ROOT}"
-export YT_TESTS_SANDBOX="$TESTS_SANDBOX" 
+export YT_TESTS_SANDBOX="$TESTS_SANDBOX"
 
 cd "$SCRIPT_DIR"
 
