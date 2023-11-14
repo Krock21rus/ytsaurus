@@ -22,6 +22,6 @@ export PYTHONPATH="$PYTHON_ROOT"
 export YT_BUILD_ROOT="${BUILD_ROOT}"
 export YT_TESTS_SANDBOX="$TESTS_SANDBOX"
 
-cd "$SCRIPT_DIR"
+cd "$SOURCE_ROOT/yt/odin/tests"
 
 python3 -m pytest -vs
