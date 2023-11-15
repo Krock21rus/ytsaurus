@@ -158,6 +158,7 @@ class YtTestEnvironment(object):
             master_cache_count=yt_instance_params.get("master_cache_count", 1),
             path=path,
             id=self.yt_instance_id,
+            fqdn="localhost",
             enable_debug_logging=True,
             enable_master_cache=True)
         self.yt_client = self.yt_instance.create_client()
@@ -176,6 +177,7 @@ class YtRandomNameTestEnvironment(object):
             node_count=3,
             path=path,
             id=self.yt_instance_id,
+            fqdn="localhost",
             cell_tag=cell_tag,
             enable_debug_logging=True)
         self.yt_client = self.yt_instance.create_client()
