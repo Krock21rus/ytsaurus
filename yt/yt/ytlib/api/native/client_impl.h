@@ -1760,6 +1760,19 @@ private:
     void DoAlterQuery(
         NQueryTrackerClient::TQueryId queryId,
         const TAlterQueryOptions& options);
+    TQuery LookupByQueryId(
+        NQueryTrackerClient::TQueryId queryId,
+        IClientPtr client,
+        const TString& root,
+        const std::optional<std::vector<TString>>& lookupKeys,
+        const NTransactionClient::TTimestamp& timestamp);
+    void CheckAccessControlByQueryId(
+        NQueryTrackerClient::TQueryId queryId,
+        const TString& root,
+        NTransactionClient::TTimestamp timestamp,
+        std::optional<TString> user,
+        IClientPtr client,
+        NYTree::EPermission permission);
 
     //
     // Authentication

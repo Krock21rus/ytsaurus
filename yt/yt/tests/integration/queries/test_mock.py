@@ -1,6 +1,6 @@
 from yt_env_setup import YTEnvSetup
 
-from yt_commands import (authors, raises_yt_error, wait, create_user, print_debug, select_rows)
+from yt_commands import (authors, create_access_control_object, make_ace, raises_yt_error, wait, create_user, print_debug, select_rows)
 
 from yt_queries import start_query, list_queries
 
@@ -176,3 +176,153 @@ class TestQueriesMock(YTEnvSetup):
 
         q.alter(annotations={"qwe": "asd"})
         assert len(list_queries(filter="asd")["queries"]) > 0
+
+    @authors("krock21")
+    def test_access_control_no_acos(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        q_u1 = start_query("mock", "u1", authenticated_user="u1")
+        q_u2 = start_query("mock", "u2", authenticated_user="u2")
+        q_u1.get(authenticated_user="u1")
+        q_u2.get(authenticated_user="u2")
+        with raises_yt_error(3903):  # Access Denied.
+            q_u1.get(authenticated_user="u2")
+        with raises_yt_error(3903):  # Access Denied.
+            q_u2.get(authenticated_user="u1")
+
+    @authors("krock21")
+    def test_access_control_simple_case(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_access_control_object(
+            "aco1",
+            "queries",
+            attributes={
+                "acl": [
+                    make_ace("allow", "u2", "use"),
+                ]
+            })
+        q_u1 = start_query("mock", "run_forever", authenticated_user="u1", access_control_object="aco1")
+        q_u2 = start_query("mock", "run_forever", authenticated_user="u2", access_control_object="aco2")
+        q_u1.get(authenticated_user="u2")
+        with raises_yt_error(500):  # Node "aco2" not found.
+            q_u2.get(authenticated_user="u1")
+
+    @authors("krock21")
+    def test_access_control_get(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_user("u3")
+        create_access_control_object(
+            "aco_get",
+            "queries",
+            attributes={
+                "acl": [
+                    make_ace("allow", "u2", "use"),
+                    make_ace("allow", "u3", "read"),
+                    make_ace("allow", "u3", "write"),
+                    make_ace("allow", "u3", "administer"),
+                ]
+            })
+        q_u1 = start_query("mock", "run_forever", authenticated_user="u1", access_control_object="aco_get")
+        q_u1.get(authenticated_user="u2")
+        with raises_yt_error(3903):  # Access Denied.
+            q_u1.get(authenticated_user="u3")
+
+    @authors("krock21")
+    def test_access_control_abort(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_user("u3")
+        create_access_control_object(
+            "aco_abort",
+            "queries",
+            attributes={
+                "acl": [
+                    make_ace("allow", "u2", "administer"),
+                    make_ace("allow", "u3", "read"),
+                    make_ace("allow", "u3", "write"),
+                    make_ace("allow", "u3", "use"),
+                ]
+            })
+        q_u1 = start_query("mock", "run_forever", authenticated_user="u1", access_control_object="aco_abort")
+        q_u1.abort(authenticated_user="u2")
+        with raises_yt_error(3903):  # Access Denied.
+            q_u1.abort(authenticated_user="u3")
+
+    @authors("krock21")
+    def test_access_control_get_query_result(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_user("u3")
+        create_access_control_object(
+            "aco_get_query_result",
+            "queries",
+            attributes={
+                "acl": [
+                    make_ace("allow", "u2", "read"),
+                    make_ace("allow", "u3", "administer"),
+                    make_ace("allow", "u3", "write"),
+                    make_ace("allow", "u3", "use"),
+                    make_ace("deny", "u3", "read"),  # doesnt work without it
+                ]
+            })
+        q_u1 = start_query("mock", "complete_after", authenticated_user="u1", access_control_object="aco_get_query_result", settings={
+            "duration": 3000,
+            "results": [
+                {"schema": [{"name": "foo", "type": "int64"}], "rows": [{"foo": 42}]},
+            ]
+        })
+        q_u1.track()
+        q_u1.get_result(0, authenticated_user="u2")
+        with raises_yt_error(3903):  # Access Denied.
+            q_u1.get_result(0, authenticated_user="u3")
+
+    @authors("krock21")
+    def test_access_control_read_query_result(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_user("u3")
+        create_access_control_object(
+            "aco_read_query_result",
+            "queries",
+            attributes={
+                "acl": [
+                    make_ace("allow", "u2", "read"),
+                    make_ace("allow", "u3", "administer"),
+                    make_ace("allow", "u3", "write"),
+                    make_ace("allow", "u3", "use"),
+                    make_ace("deny", "u3", "read"),  # doesnt work without it
+                ]
+            })
+        q_u1 = start_query("mock", "complete_after", authenticated_user="u1", access_control_object="aco_read_query_result", settings={
+            "duration": 3000,
+            "results": [
+                {"schema": [{"name": "foo", "type": "int64"}], "rows": [{"foo": 42}]},
+            ]
+        })
+        q_u1.track()
+        q_u1.read_result(0, authenticated_user="u2")
+        with raises_yt_error(3903):  # Access Denied.
+            q_u1.read_result(0, authenticated_user="u3")
+
+    @authors("krock21")
+    def test_access_control_alter(self, query_tracker):
+        create_user("u1")
+        create_user("u2")
+        create_user("u3")
+        create_access_control_object(
+            "aco_alter",
+            "queries",
+            attributes={
+                "acl": [
+                    make_ace("allow", "u2", "administer"),
+                    make_ace("allow", "u3", "read"),
+                    make_ace("allow", "u3", "write"),
+                    make_ace("allow", "u3", "use"),
+                ]
+            })
+        q_u1 = start_query("mock", "run_forever", authenticated_user="u1", access_control_object="aco_alter")
+        q_u1.alter(authenticated_user="u2", annotations={"qwe": "asd"})
+        with raises_yt_error(3903):  # Access Denied.
+            q_u1.alter(authenticated_user="u3", annotations={"qwe2": "asd3"})
