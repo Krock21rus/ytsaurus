@@ -193,6 +193,31 @@ class TestSimpleQueriesYql(TestQueriesYqlBase):
         result = query.read_result(0)
         assert_items_equal([{"column0": 85}], result)
 
+    @authors("aleksandr.gaev")
+    def test_yql_execution_modes(self, query_tracker, yql_agent):
+        create("table", "//tmp/t1", attributes={
+            "schema": [{"name": "a", "type": "int64"}]
+        })
+        rows = [{"a": 42}, {"a": 43}]
+        write_table("//tmp/t1", rows)
+
+
+        q_0 = start_query("yql", "select * from `//tmp/t1`", settings={"random_attribute": 0})
+        q_0.track()
+
+        q_default = start_query("yql", "select * from `//tmp/t1`")
+        q_default.track()
+        q_run = start_query("yql", "select * from `//tmp/t1`", settings={"execution_mode": 2})
+        q_run.track()
+        q_optimize = start_query("yql", "select * from `//tmp/t1`", settings={"execution_mode": 1})
+        q_optimize.track()
+        q_validate = start_query("yql", "select * from `//tmp/t1`", settings={"execution_mode": 0})
+        q_validate.track()
+
+        print(q_validate.get())
+        print(q_optimize.get())
+        print(q_run.get())
+
 
 class TestYqlAgent(TestQueriesYqlBase):
     NUM_TEST_PARTITIONS = 8

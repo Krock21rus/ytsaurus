@@ -131,16 +131,28 @@ public:
                 THROW_ERROR error;
             }
             YT_LOG_DEBUG("YQL plugin progress call completed");
+            YT_LOG_DEBUG("PROGRESS. progress: %Qv", result.Progress.value_or("no progress"));
+            YT_LOG_DEBUG("PROGRESS. plan: %Qv", result.Plan.value_or("no plan"));
+            YT_LOG_DEBUG("PROGRESS. YsonResult: %Qv", result.YsonResult.value_or("no YsonResult"));
+            YT_LOG_DEBUG("PROGRESS. Statistics: %Qv", result.Statistics.value_or("no Statistics"));
+            YT_LOG_DEBUG("PROGRESS. TaskInfo: %Qv", result.TaskInfo.value_or("no TaskInfo"));
 
             if (result.Plan || result.Progress) {
+            YT_LOG_DEBUG("PROGRESS If1");
                 TYqlResponse yqlResponse;
+            YT_LOG_DEBUG("PROGRESS If2");
                 ValidateAndFillYqlResponseField(yqlResponse, result.Plan, &TYqlResponse::mutable_plan);
+            YT_LOG_DEBUG("PROGRESS If3");
                 ValidateAndFillYqlResponseField(yqlResponse, result.Progress, &TYqlResponse::mutable_progress);
+            YT_LOG_DEBUG("PROGRESS If4");
                 response.mutable_yql_response()->Swap(&yqlResponse);
+            YT_LOG_DEBUG("PROGRESS If5");
             }
+            YT_LOG_DEBUG("PROGRESS Returning response");
             return response;
         } catch (const std::exception& ex) {
             auto error = TError("YQL plugin call failed") << TError(ex);
+            YT_LOG_DEBUG("PROGRESS YQL plugin call failed");
             YT_LOG_INFO(error, "YQL plugin call failed");
             THROW_ERROR error;
         }
@@ -169,10 +181,13 @@ private:
         TRspStartQuery response;
 
         YT_LOG_INFO("Invoking YQL embedded");
+        YT_LOG_DEBUG("YQL AGENT RECEIVED REQUEST: %Qv", yqlRequest.DebugString());
 
         std::vector<TSharedRef> wireRowsets;
         try {
+            YT_LOG_DEBUG("START 1");
             auto query = Format("pragma yt.UseNativeYtTypes; pragma ResultRowsLimit=\"%v\";\n%v", request.row_count_limit(), yqlRequest.query());
+            YT_LOG_DEBUG("START 2");
             auto settings = yqlRequest.has_settings() ? TYsonString(yqlRequest.settings()) : EmptyMap;
 
             std::vector<NYqlPlugin::TQueryFile> files;
@@ -186,23 +201,40 @@ private:
             }
 
             // This is a long blocking call.
+            YT_LOG_DEBUG("START 3");
             auto result = YqlPlugin_->Run(queryId, impersonationUser, query, settings, files);
+            YT_LOG_DEBUG("START progress: %Qv", result.Progress.value_or("no progress"));
+            YT_LOG_DEBUG("START plan: %Qv", result.Plan.value_or("no plan"));
+            YT_LOG_DEBUG("START YsonResult: %Qv", result.YsonResult.value_or("no YsonResult"));
+            YT_LOG_DEBUG("START Statistics: %Qv", result.Statistics.value_or("no Statistics"));
+            YT_LOG_DEBUG("START TaskInfo: %Qv", result.TaskInfo.value_or("no TaskInfo"));
+            YT_LOG_DEBUG("START YsonError: %Qv", result.YsonError.value_or("no YsonError"));
             if (result.YsonError) {
-                auto error = ConvertTo<TError>(TYsonString(*result.YsonError));
-                THROW_ERROR error;
+                YT_LOG_DEBUG("START 4");
+            auto error = ConvertTo<TError>(TYsonString(*result.YsonError));
+                YT_LOG_DEBUG("START 5");
+            THROW_ERROR error;
             }
 
             YT_LOG_INFO("YQL plugin call completed");
 
             TYqlResponse yqlResponse;
+            YT_LOG_DEBUG("START 6");
             ValidateAndFillYqlResponseField(yqlResponse, result.YsonResult, &TYqlResponse::mutable_result);
+            YT_LOG_DEBUG("START 7");
             ValidateAndFillYqlResponseField(yqlResponse, result.Plan, &TYqlResponse::mutable_plan);
+            YT_LOG_DEBUG("START 8");
             ValidateAndFillYqlResponseField(yqlResponse, result.Statistics, &TYqlResponse::mutable_statistics);
+            YT_LOG_DEBUG("START 9");
             ValidateAndFillYqlResponseField(yqlResponse, result.Progress, &TYqlResponse::mutable_progress);
+            YT_LOG_DEBUG("START 10");
             ValidateAndFillYqlResponseField(yqlResponse, result.TaskInfo, &TYqlResponse::mutable_task_info);
+            YT_LOG_DEBUG("START 11");
             if (request.build_rowsets() && result.YsonResult) {
+                YT_LOG_DEBUG("START IF1");
                 auto rowsets = BuildRowsets(ClientDirectory_, *result.YsonResult, request.row_count_limit());
 
+                YT_LOG_DEBUG("START IF2");
                 for (const auto& rowset : rowsets) {
                     if (rowset.Error.IsOK()) {
                         wireRowsets.push_back(rowset.WireRowset);
@@ -215,10 +247,13 @@ private:
                     }
                 }
             }
+            YT_LOG_DEBUG("START 6");
             response.mutable_yql_response()->Swap(&yqlResponse);
+            YT_LOG_DEBUG("START 7");
             return {response, wireRowsets};
         } catch (const std::exception& ex) {
             auto error = TError("YQL plugin call failed") << TError(ex);
+            YT_LOG_DEBUG("START YQL plugin call failed");
             YT_LOG_INFO(error, "YQL plugin call failed");
             THROW_ERROR error;
         }

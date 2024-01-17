@@ -481,7 +481,7 @@ class YTEnvSetup(object):
             enable_permission_cache=cls.get_param("USE_PERMISSION_CACHE", index),
             primary_cell_tag=(index + 1) * 10,
             enable_structured_logging=True,
-            enable_log_compression=True,
+            enable_log_compression=False,
             log_compression_method="zstd",
             node_port_set_size=cls.get_param("NODE_PORT_SET_SIZE", index),
             store_location_count=cls.get_param("STORE_LOCATION_COUNT", index),
