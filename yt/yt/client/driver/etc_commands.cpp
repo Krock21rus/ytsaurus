@@ -90,6 +90,9 @@ void TGetSupportedFeaturesCommand::DoExecute(ICommandContextPtr context)
     context->ProduceOutputValue(BuildYsonStringFluently()
         .BeginMap()
             .Item("features").Value(meta.Features)
+            .Item("proxy_features").BeginMap()
+                .Item("user_tokens_metadata").Value(true)    
+            .EndMap()
         .EndMap());
 }
 
