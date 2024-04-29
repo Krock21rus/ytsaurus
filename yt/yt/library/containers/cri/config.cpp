@@ -31,6 +31,10 @@ void TCriExecutorConfig::Register(TRegistrar registrar)
             "server is not initialized yet",
             // https://github.com/containerd/containerd/issues/9160
             "failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to create new parent process: namespace path: lstat /proc/0/ns/ipc: no such file or directory: unknown",
+            // https://github.com/containerd/containerd/issues/6080
+            "failed to delete containerd container",
+            // https://github.com/containerd/containerd/issues/3787
+            "failed to prepare extraction snapshot",
         });
 }
 
