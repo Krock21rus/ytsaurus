@@ -3,5 +3,6 @@ RECURSE(
     local
     query-tracker
     systest
+    ya-build
     ytsaurus
 )
