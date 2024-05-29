@@ -14,6 +14,7 @@
 #include <yt/yt/core/ytree/yson_struct.h>
 
 #include <yt/yt/core/misc/fs.h>
+#include <yt/yt/core/misc/sync_cache.h>
 
 #include <yt/yt/client/misc/workload.h>
 
@@ -106,6 +107,10 @@ public:
     double DefaultPoolWeight;
     double UserInteractivePoolWeight;
 
+    // Two level fair-share thread pool settings.
+    THashMap<TString, double> PoolWeights;
+    TSlruCacheConfigPtr BucketCacheConfig;
+
     REGISTER_YSON_STRUCT(TThreadPoolIOEngineConfig);
 
     static void Register(TRegistrar registrar)
@@ -137,6 +142,11 @@ public:
         registrar.Parameter("user_interactive_pool_weight", &TThis::UserInteractivePoolWeight)
             .GreaterThanOrEqual(1)
             .Default(4);
+
+        registrar.Parameter("pool_weights", &TThis::PoolWeights)
+            .Default();
+        registrar.Parameter("bucket_cache", &TThis::BucketCacheConfig)
+            .DefaultCtor([] () { return TSlruCacheConfig::CreateWithCapacity(1000); });
     }
 };
 
@@ -264,6 +274,147 @@ private:
 
     const TPoolDescriptor DefaultPool_;
     const TPoolDescriptor UserInteractivePool_;
+};
+
+class TTwoLevelPoolWeightProvider
+    : public IPoolWeightProvider
+{
+public:
+    TTwoLevelPoolWeightProvider(THashMap<TString, double> poolWeights)
+        : PoolWeights_(std::move(poolWeights))
+    { }
+
+    double GetWeight(const TString& poolName) override {
+        if (auto it = PoolWeights_.find(poolName); it != PoolWeights_.end()) {
+            return it->second;
+        } else {
+            return 1.0;
+        }
+    }
+
+    void Configure(THashMap<TString, double> poolWeights) {
+        PoolWeights_ = std::move(poolWeights);
+    }
+
+private:
+    THashMap<TString, double> PoolWeights_;
+};
+
+class TCachedInvoker
+    : public TSyncCacheValueBase<std::pair<TString, TString>, IInvoker>
+{
+public:
+    TCachedInvoker(
+        const std::pair<TString, TString>& poolAndBucket,
+        IInvokerPtr invoker)
+        : TSyncCacheValueBase(poolAndBucket)
+        , Invoker_(std::move(invoker))
+    { }
+
+    IInvokerPtr GetInvoker()
+    {
+        return Invoker_;
+    }
+
+private:
+    IInvokerPtr Invoker_;
+};
+
+// Caches pointers to buckets in order to prolong their live(and progress) between calls.
+class TBucketCache
+    : public TSyncSlruCacheBase<std::pair<TString, TString>, TCachedInvoker>
+{
+public:
+    TBucketCache(
+        TSlruCacheConfigPtr config)
+        : TSyncSlruCacheBase<std::pair<TString, TString>, TCachedInvoker>(std::move(config))
+    { }
+
+    IInvokerPtr Get(
+        const ITwoLevelFairShareThreadPoolPtr threadPool,
+        const TString& poolName,
+        const TString& bucketTag,
+        const double bucketWeight)
+    {
+        auto cachedBucket = Find(std::make_pair(poolName, bucketTag));
+        if (!cachedBucket) {
+            cachedBucket = New<TCachedInvoker>(std::make_pair(poolName, bucketTag), threadPool->GetInvoker(poolName, bucketTag, bucketWeight));
+            TryInsert(cachedBucket, &cachedBucket);
+        }
+        return cachedBucket->GetInvoker();
+    }
+};
+
+class TTwoLevelFairShareThreadPool
+{
+public:
+    TTwoLevelFairShareThreadPool(
+        TThreadPoolIOEngineConfigPtr config,
+        const TString& locationId,
+        NLogging::TLogger logger)
+        : PoolWeights_(New<TTwoLevelPoolWeightProvider>(config->PoolWeights))
+        , ReadThreadPool_(CreateNewTwoLevelFairShareThreadPool(
+            config->ReadThreadCount,
+            Format("LocationRead:%v", locationId),
+            {
+                PoolWeights_
+            }))
+        , WriteThreadPool_(CreateNewTwoLevelFairShareThreadPool(
+            config->WriteThreadCount,
+            Format("LocationWrite:%v", locationId),
+            {
+                PoolWeights_
+            }))
+        , Logger(logger)
+        , BucketCache_(New<TBucketCache>(config->BucketCacheConfig))
+    { }
+
+    IInvokerPtr GetReadInvoker(TWorkloadDescriptor workloadDescriptor, TIOEngineBase::TSessionId sessionId)
+    {
+        const auto& poolName = ToString(workloadDescriptor.Category);
+        const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
+        const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        return BucketCache_->Get(ReadThreadPool_, poolName, bucketTag, bucketWeight);
+    }
+
+    IInvokerPtr GetWriteInvoker(TWorkloadDescriptor workloadDescriptor, TIOEngineBase::TSessionId sessionId)
+    {
+        const auto& poolName = ToString(workloadDescriptor.Category);
+        const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
+        const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        return BucketCache_->Get(WriteThreadPool_, poolName, bucketTag, bucketWeight);
+    }
+
+    void Reconfigure(const TThreadPoolIOEngineConfigPtr& config)
+    {
+        PoolWeights_->Configure(config->PoolWeights);
+        ReadThreadPool_->Configure(config->ReadThreadCount);
+        WriteThreadPool_->Configure(config->WriteThreadCount);
+    }
+
+private:
+    TString GetBucketTag(TWorkloadDescriptor workloadDescriptor, TIOEngineBase::TSessionId sessionId) {
+        if (workloadDescriptor.DiskFairShareBucketTag) {
+            return *workloadDescriptor.DiskFairShareBucketTag;
+        } else {
+            return ToString(sessionId);
+        }
+    }
+
+    double GetBucketWeight(TWorkloadDescriptor workloadDescriptor) {
+        if (workloadDescriptor.DiskFairShareBucketWeight && *workloadDescriptor.DiskFairShareBucketWeight > 0) {
+            return *workloadDescriptor.DiskFairShareBucketWeight;
+        } else {
+            return 1.0;
+        }
+    }
+
+private:
+    TIntrusivePtr<TTwoLevelPoolWeightProvider> PoolWeights_;
+    const ITwoLevelFairShareThreadPoolPtr ReadThreadPool_;
+    const ITwoLevelFairShareThreadPoolPtr WriteThreadPool_;
+    const NLogging::TLogger Logger;
+    TIntrusivePtr<TBucketCache> BucketCache_;
 };
 
 template <typename TThreadPool, typename TRequestSlicer>
@@ -746,6 +897,7 @@ IIOEnginePtr CreateIOEngine(
 {
     using TClassicThreadPoolIOEngine = TThreadPoolIOEngine<TFixedPriorityExecutor, TDummyRequestSlicer>;
     using TFairShareThreadPoolIOEngine = TThreadPoolIOEngine<TFairShareThreadPool, TIORequestSlicer>;
+    using TTwoLevelFairShareThreadPoolIOEngine = TThreadPoolIOEngine<TTwoLevelFairShareThreadPool, TIORequestSlicer>;
 
     switch (engineType) {
         case EIOEngineType::ThreadPool:
@@ -770,6 +922,13 @@ IIOEnginePtr CreateIOEngine(
                 std::move(locationId),
                 std::move(profiler),
                 std::move(logger));
+        case NYT::NIO::EIOEngineType::TwoLevelFairShareThreadPool:
+            return CreateIOEngine<TTwoLevelFairShareThreadPoolIOEngine>(
+                std::move(ioConfig),
+                std::move(locationId),
+                std::move(profiler),
+                std::move(logger)
+            );
         default:
             THROW_ERROR_EXCEPTION("Unknown IO engine %Qlv",
                 engineType);
