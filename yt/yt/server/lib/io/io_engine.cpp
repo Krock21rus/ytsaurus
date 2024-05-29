@@ -26,6 +26,7 @@
 
 #include <util/generic/size_literals.h>
 #include <util/generic/xrange.h>
+#include <util/generic/set.h>
 
 #include <array>
 
@@ -109,7 +110,7 @@ public:
 
     // Two level fair-share thread pool settings.
     THashMap<TString, double> PoolWeights;
-    TSlruCacheConfigPtr BucketCacheConfig;
+    TDuration BucketTtl;
 
     REGISTER_YSON_STRUCT(TThreadPoolIOEngineConfig);
 
@@ -145,8 +146,8 @@ public:
 
         registrar.Parameter("pool_weights", &TThis::PoolWeights)
             .Default();
-        registrar.Parameter("bucket_cache", &TThis::BucketCacheConfig)
-            .DefaultCtor([] () { return TSlruCacheConfig::CreateWithCapacity(1000); });
+        registrar.Parameter("bucket_ttl", &TThis::BucketTtl)
+            .Default(TDuration::Minutes(5));
     }
 };
 
@@ -300,34 +301,27 @@ private:
     THashMap<TString, double> PoolWeights_;
 };
 
-class TCachedInvoker
-    : public TSyncCacheValueBase<std::pair<TString, TString>, IInvoker>
+struct TBucketCacheEntry final
 {
-public:
-    TCachedInvoker(
-        const std::pair<TString, TString>& poolAndBucket,
-        IInvokerPtr invoker)
-        : TSyncCacheValueBase(poolAndBucket)
-        , Invoker_(std::move(invoker))
-    { }
-
-    IInvokerPtr GetInvoker()
-    {
-        return Invoker_;
-    }
-
-private:
-    IInvokerPtr Invoker_;
+    NProfiling::TCpuInstant LastAccessTime;
+    TString PoolName;
+    TString BucketName;
+    IInvokerPtr InvokerPtr;
 };
 
+bool operator < (const TIntrusivePtr<TBucketCacheEntry>& lhs, const TIntrusivePtr<TBucketCacheEntry>& rhs) {
+    return std::tie(lhs->LastAccessTime, lhs->PoolName, lhs->BucketName) < std::tie(rhs->LastAccessTime, rhs->PoolName, rhs->BucketName);
+}
+
 // Caches pointers to buckets in order to prolong their live(and progress) between calls.
-class TBucketCache
-    : public TSyncSlruCacheBase<std::pair<TString, TString>, TCachedInvoker>
+class TBucketCache final
 {
 public:
     TBucketCache(
-        TSlruCacheConfigPtr config)
-        : TSyncSlruCacheBase<std::pair<TString, TString>, TCachedInvoker>(std::move(config))
+        TDuration bucketTtl,
+        NLogging::TLogger logger)
+        : EntryTtl(bucketTtl)
+        , Logger(logger)
     { }
 
     IInvokerPtr Get(
@@ -336,13 +330,46 @@ public:
         const TString& bucketTag,
         const double bucketWeight)
     {
-        auto cachedBucket = Find(std::make_pair(poolName, bucketTag));
-        if (!cachedBucket) {
-            cachedBucket = New<TCachedInvoker>(std::make_pair(poolName, bucketTag), threadPool->GetInvoker(poolName, bucketTag, bucketWeight));
-            TryInsert(cachedBucket, &cachedBucket);
+        auto guard = Guard(Lock);
+        auto now = NProfiling::GetCpuInstant();
+        FlushByTtl(now);
+
+        auto entry = KeyToEntry.find(std::make_pair(poolName, bucketTag));
+        if (entry != KeyToEntry.end()) {
+            EntriesSet.erase(entry->second);
+            entry->second->LastAccessTime = now;
+            EntriesSet.insert(entry->second);
+            return entry->second->InvokerPtr;
+        } else {
+            YT_LOG_DEBUG("TBucketCache miss for %v %v", poolName, bucketTag);
+            auto newEntry = New<TBucketCacheEntry>();
+            newEntry->LastAccessTime = now;
+            newEntry->PoolName = poolName;
+            newEntry->BucketName = bucketTag;
+            newEntry->InvokerPtr = threadPool->GetInvoker(poolName, bucketTag, bucketWeight);
+            KeyToEntry[std::make_pair(poolName, bucketTag)] = newEntry;
+            EntriesSet.insert(newEntry);
+            return newEntry->InvokerPtr;
         }
-        return cachedBucket->GetInvoker();
     }
+
+private:
+    // Should be called with Lock acquired.
+    void FlushByTtl(NProfiling::TCpuInstant now) {
+        while (!EntriesSet.empty() && (*EntriesSet.begin())->LastAccessTime + NProfiling::DurationToCpuDuration(EntryTtl) < now) {
+            auto entry = *EntriesSet.begin();
+            YT_LOG_DEBUG("TBucketCache erase by ttl for %v %v", entry->PoolName, entry->BucketName);
+            EntriesSet.erase(EntriesSet.begin());
+            KeyToEntry.erase(std::make_pair(entry->PoolName, entry->BucketName));
+        }
+    }
+
+private:
+    const TDuration EntryTtl;
+    const NLogging::TLogger Logger;
+    YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, Lock);
+    THashMap<std::pair<TString, TString>, TIntrusivePtr<TBucketCacheEntry>> KeyToEntry;
+    TSet<TIntrusivePtr<TBucketCacheEntry>> EntriesSet;
 };
 
 class TTwoLevelFairShareThreadPool
@@ -355,18 +382,20 @@ public:
         : PoolWeights_(New<TTwoLevelPoolWeightProvider>(config->PoolWeights))
         , ReadThreadPool_(CreateNewTwoLevelFairShareThreadPool(
             config->ReadThreadCount,
-            Format("LocationRead:%v", locationId),
+            Format("LRead:%v", locationId),
             {
-                PoolWeights_
+                PoolWeights_,
+                true // TODO change to false verbose logging
             }))
         , WriteThreadPool_(CreateNewTwoLevelFairShareThreadPool(
             config->WriteThreadCount,
-            Format("LocationWrite:%v", locationId),
+            Format("LWrite:%v", locationId),
             {
-                PoolWeights_
+                PoolWeights_,
+                true // TODO change to false verbose logging
             }))
         , Logger(logger)
-        , BucketCache_(New<TBucketCache>(config->BucketCacheConfig))
+        , BucketCache_(New<TBucketCache>(config->BucketTtl, logger))
     { }
 
     IInvokerPtr GetReadInvoker(TWorkloadDescriptor workloadDescriptor, TIOEngineBase::TSessionId sessionId)
@@ -374,6 +403,9 @@ public:
         const auto& poolName = ToString(workloadDescriptor.Category);
         const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
         const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        if (!sessionId) {
+            YT_LOG_DEBUG("No sessionId received for GetReadInvoker");
+        }
         return BucketCache_->Get(ReadThreadPool_, poolName, bucketTag, bucketWeight);
     }
 
@@ -382,6 +414,9 @@ public:
         const auto& poolName = ToString(workloadDescriptor.Category);
         const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
         const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        if (!sessionId) {
+            YT_LOG_DEBUG("No sessionId received for GetWriteInvoker");
+        }
         return BucketCache_->Get(WriteThreadPool_, poolName, bucketTag, bucketWeight);
     }
 
@@ -395,16 +430,21 @@ public:
 private:
     TString GetBucketTag(TWorkloadDescriptor workloadDescriptor, TIOEngineBase::TSessionId sessionId) {
         if (workloadDescriptor.DiskFairShareBucketTag) {
+            YT_LOG_DEBUG("Getting bucket tag from workload descriptor: %v", *workloadDescriptor.DiskFairShareBucketTag);
             return *workloadDescriptor.DiskFairShareBucketTag;
-        } else {
+        } else if (sessionId) {
+            YT_LOG_DEBUG("Getting bucket tag from sessionId: %v", ToString(sessionId));
             return ToString(sessionId);
         }
+        return ToString(sessionId);
     }
 
     double GetBucketWeight(TWorkloadDescriptor workloadDescriptor) {
         if (workloadDescriptor.DiskFairShareBucketWeight && *workloadDescriptor.DiskFairShareBucketWeight > 0) {
+            YT_LOG_DEBUG("Getting bucket weight from workload descriptor: %v", ToString(*workloadDescriptor.DiskFairShareBucketWeight));
             return *workloadDescriptor.DiskFairShareBucketWeight;
         } else {
+            YT_LOG_DEBUG("Getting bucket weight from default value: 1.0");
             return 1.0;
         }
     }

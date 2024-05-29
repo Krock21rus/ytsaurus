@@ -6,6 +6,7 @@
 #include <yt/yt/ytlib/chunk_client/deferred_chunk_meta.h>
 #include <yt/yt/ytlib/chunk_client/format.h>
 #include <yt/yt/ytlib/chunk_client/block.h>
+#include <yt/yt/ytlib/chunk_client/session_id.h>
 
 #include <yt/yt/client/chunk_client/chunk_replica.h>
 
@@ -132,12 +133,28 @@ bool TChunkFileWriter::WriteBlock(
     const TWorkloadDescriptor& workloadDescriptor,
     const TBlock& block)
 {
-    return WriteBlocks(workloadDescriptor, {block});
+    return WriteBlockWithSession(workloadDescriptor, block, {});
 }
 
 bool TChunkFileWriter::WriteBlocks(
     const TWorkloadDescriptor& workloadDescriptor,
     const std::vector<TBlock>& blocks)
+{
+    return WriteBlocksWithSession(workloadDescriptor, blocks, {});
+}
+
+bool TChunkFileWriter::WriteBlockWithSession(
+    const TWorkloadDescriptor& workloadDescriptor,
+    const TBlock& block,
+    NYT::TGuid sessionId)
+{
+    return WriteBlocksWithSession(workloadDescriptor, {block}, sessionId);
+}
+
+bool TChunkFileWriter::WriteBlocksWithSession(
+    const TWorkloadDescriptor& workloadDescriptor,
+    const std::vector<TBlock>& blocks,
+    NYT::TGuid sessionId)
 {
     if (auto error = TryChangeState(EState::Ready, EState::WritingBlocks); !error.IsOK()) {
         ReadyEvent_ = MakeFuture<void>(std::move(error));
@@ -170,7 +187,8 @@ bool TChunkFileWriter::WriteBlocks(
             std::move(buffers),
             SyncOnClose_
         },
-        workloadDescriptor.Category)
+        workloadDescriptor.Category,
+        sessionId)
         .Apply(BIND([=, this, this_ = MakeStrong(this), newDataSize = currentOffset] (const TError& error) {
             YT_VERIFY(State_.load() == EState::WritingBlocks);
 
@@ -201,6 +219,14 @@ TFuture<void> TChunkFileWriter::GetReadyEvent()
 TFuture<void> TChunkFileWriter::Close(
     const TWorkloadDescriptor& workloadDescriptor,
     const TDeferredChunkMetaPtr& chunkMeta)
+{
+    return CloseWithSession(workloadDescriptor, chunkMeta, {});
+}
+
+TFuture<void> TChunkFileWriter::CloseWithSession(
+    const TWorkloadDescriptor& workloadDescriptor,
+    const TDeferredChunkMetaPtr& chunkMeta,
+    NYT::TGuid sessionId)
 {
     if (auto error = TryChangeState(EState::Ready, EState::Closing); !error.IsOK()) {
         return MakeFuture<void>(std::move(error));
@@ -249,7 +275,8 @@ TFuture<void> TChunkFileWriter::Close(
                     {std::move(buffer)},
                     SyncOnClose_
                 },
-                workloadDescriptor.Category)
+                workloadDescriptor.Category,
+                sessionId)
                 .Apply(BIND(&IIOEngine::Close, IOEngine_, IIOEngine::TCloseRequest{
                     std::move(chunkMetaFile),
                     MetaDataSize_,
