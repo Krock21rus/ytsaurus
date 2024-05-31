@@ -14,6 +14,7 @@
 #include <yt/yt/core/ytree/yson_struct.h>
 
 #include <yt/yt/core/misc/fs.h>
+#include <yt/yt/core/misc/sync_cache.h>
 
 #include <yt/yt/client/misc/workload.h>
 
@@ -25,6 +26,7 @@
 
 #include <util/generic/size_literals.h>
 #include <util/generic/xrange.h>
+#include <util/generic/set.h>
 
 #include <array>
 
@@ -36,6 +38,8 @@ namespace NYT::NIO {
 
 using namespace NConcurrency;
 using namespace NProfiling;
+
+using TSessionId = TIOEngineBase::TSessionId;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -58,16 +62,16 @@ void TIOEngineHandle::MarkOpenForDirectIO(EOpenMode* oMode)
 
 TFuture<TSharedRef> IIOEngine::ReadAll(
     const TString& path,
-    EWorkloadCategory category,
-    TSessionId sessionId)
+    const TWorkloadDescriptor& descriptor,
+    const TSessionId& sessionId)
 {
-    return Open({path, OpenExisting | RdOnly | Seq | CloseOnExec}, category)
+    return Open({path, OpenExisting | RdOnly | Seq | CloseOnExec}, descriptor, sessionId)
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TIOEngineHandlePtr& handle) {
             struct TReadAllBufferTag
             { };
             return Read(
                 {{handle, 0, handle->GetLength()}},
-                category,
+                descriptor,
                 GetRefCountedTypeCookie<TReadAllBufferTag>(),
                 sessionId)
                 .Apply(BIND(
@@ -75,7 +79,7 @@ TFuture<TSharedRef> IIOEngine::ReadAll(
                     (const TReadResponse& response)
                 {
                     YT_VERIFY(response.OutputBuffers.size() == 1);
-                    return Close({.Handle = handle}, category)
+                    return Close({.Handle = handle}, descriptor, sessionId)
                         .Apply(BIND([buffers = response.OutputBuffers] {
                             return buffers[0];
                         }));
@@ -105,6 +109,10 @@ public:
     // Fair-share thread pool settings.
     double DefaultPoolWeight;
     double UserInteractivePoolWeight;
+
+    // Two level fair-share thread pool settings.
+    THashMap<TString, double> PoolWeights;
+    TDuration BucketTtl;
 
     REGISTER_YSON_STRUCT(TThreadPoolIOEngineConfig);
 
@@ -137,6 +145,11 @@ public:
         registrar.Parameter("user_interactive_pool_weight", &TThis::UserInteractivePoolWeight)
             .GreaterThanOrEqual(1)
             .Default(4);
+
+        registrar.Parameter("pool_weights", &TThis::PoolWeights)
+            .Default();
+        registrar.Parameter("bucket_ttl", &TThis::BucketTtl)
+            .Default(TDuration::Minutes(5));
     }
 };
 
@@ -157,14 +170,14 @@ public:
         , WriteInvoker_(CreatePrioritizedInvoker(WriteThreadPool_->GetInvoker(), NProfiling::TTagSet({{"invoker", "fixed_priority_executor_writer"}, {"location_id", locationId}})))
     { }
 
-    IInvokerPtr GetReadInvoker(EWorkloadCategory category, TIOEngineBase::TSessionId)
+    IInvokerPtr GetReadInvoker(const TWorkloadDescriptor& descriptor, TIOEngineBase::TSessionId)
     {
-        return CreateFixedPriorityInvoker(ReadInvoker_, GetBasicPriority(category));
+        return CreateFixedPriorityInvoker(ReadInvoker_, GetBasicPriority(descriptor.Category));
     }
 
-    IInvokerPtr GetWriteInvoker(EWorkloadCategory category, TIOEngineBase::TSessionId)
+    IInvokerPtr GetWriteInvoker(const TWorkloadDescriptor& descriptor, TIOEngineBase::TSessionId)
     {
-        return CreateFixedPriorityInvoker(WriteInvoker_, GetBasicPriority(category));
+        return CreateFixedPriorityInvoker(WriteInvoker_, GetBasicPriority(descriptor.Category));
     }
 
     void Reconfigure(const TThreadPoolIOEngineConfigPtr& config)
@@ -224,15 +237,15 @@ public:
         , UserInteractivePool_{"UserInteractive", config->UserInteractivePoolWeight}
     { }
 
-    IInvokerPtr GetReadInvoker(EWorkloadCategory category, TIOEngineBase::TSessionId client)
+    IInvokerPtr GetReadInvoker(const TWorkloadDescriptor& descriptor, TIOEngineBase::TSessionId client)
     {
-        const auto& pool = GetPoolByCategory(category);
+        const auto& pool = GetPoolByCategory(descriptor.Category);
         return ReadThreadPool_->GetInvoker(pool.Name, ToString(client));
     }
 
-    IInvokerPtr GetWriteInvoker(EWorkloadCategory category, TIOEngineBase::TSessionId)
+    IInvokerPtr GetWriteInvoker(const TWorkloadDescriptor& descriptor, TIOEngineBase::TSessionId)
     {
-        return CreateFixedPriorityInvoker(WriteInvoker_, GetBasicPriority(category));
+        return CreateFixedPriorityInvoker(WriteInvoker_, GetBasicPriority(descriptor.Category));
     }
 
     void Reconfigure(const TThreadPoolIOEngineConfigPtr& config)
@@ -266,6 +279,176 @@ private:
     const TPoolDescriptor UserInteractivePool_;
 };
 
+class TTwoLevelPoolWeightProvider
+    : public IPoolWeightProvider
+{
+public:
+    TTwoLevelPoolWeightProvider(THashMap<TString, double> poolWeights)
+        : PoolWeights_(std::move(poolWeights))
+    { }
+
+    double GetWeight(const TString& poolName) override {
+        if (auto it = PoolWeights_.find(poolName); it != PoolWeights_.end()) {
+            return it->second;
+        } else {
+            return 1.0;
+        }
+    }
+
+    void Configure(THashMap<TString, double> poolWeights) {
+        PoolWeights_ = std::move(poolWeights);
+    }
+
+private:
+    THashMap<TString, double> PoolWeights_;
+};
+
+struct TBucketCacheEntry final
+{
+    NProfiling::TCpuInstant LastAccessTime;
+    TString PoolName;
+    TString BucketName;
+    IInvokerPtr InvokerPtr;
+};
+
+bool operator < (const TIntrusivePtr<TBucketCacheEntry>& lhs, const TIntrusivePtr<TBucketCacheEntry>& rhs) {
+    return std::tie(lhs->LastAccessTime, lhs->PoolName, lhs->BucketName) < std::tie(rhs->LastAccessTime, rhs->PoolName, rhs->BucketName);
+}
+
+// Caches pointers to buckets in order to prolong their live(and progress) between calls.
+class TBucketCache final
+{
+public:
+    TBucketCache(
+        TDuration bucketTtl,
+        NLogging::TLogger logger)
+        : EntryTtl_(bucketTtl)
+        , Logger_(logger)
+    { }
+
+    IInvokerPtr Get(
+        const ITwoLevelFairShareThreadPoolPtr threadPool,
+        const TString& poolName,
+        const TString& bucketTag,
+        const double bucketWeight)
+    {
+        auto guard = Guard(Lock_);
+        auto now = NProfiling::GetCpuInstant();
+        FlushByTtl(now);
+
+        auto entry = KeyToEntry_.find(std::make_pair(poolName, bucketTag));
+        if (entry != KeyToEntry_.end()) {
+            EntriesSet_.erase(entry->second);
+            entry->second->LastAccessTime = now;
+            EntriesSet_.insert(entry->second);
+            return entry->second->InvokerPtr;
+        } else {
+            auto newEntry = New<TBucketCacheEntry>();
+            newEntry->LastAccessTime = now;
+            newEntry->PoolName = poolName;
+            newEntry->BucketName = bucketTag;
+            newEntry->InvokerPtr = threadPool->GetInvoker(poolName, bucketTag, bucketWeight);
+            KeyToEntry_[std::make_pair(poolName, bucketTag)] = newEntry;
+            EntriesSet_.insert(newEntry);
+            return newEntry->InvokerPtr;
+        }
+    }
+
+private:
+    // Should be called with Lock acquired.
+    void FlushByTtl(NProfiling::TCpuInstant now) {
+        while (!EntriesSet_.empty() && (*EntriesSet_.begin())->LastAccessTime + NProfiling::DurationToCpuDuration(EntryTtl_) < now) {
+            auto entry = *EntriesSet_.begin();
+            EntriesSet_.erase(EntriesSet_.begin());
+            KeyToEntry_.erase(std::make_pair(entry->PoolName, entry->BucketName));
+        }
+    }
+
+private:
+    const TDuration EntryTtl_;
+    const NLogging::TLogger Logger_;
+    YT_DECLARE_SPIN_LOCK(NThreading::TSpinLock, Lock_);
+    THashMap<std::pair<TString, TString>, TIntrusivePtr<TBucketCacheEntry>> KeyToEntry_;
+    TSet<TIntrusivePtr<TBucketCacheEntry>> EntriesSet_;
+};
+
+class TTwoLevelFairShareThreadPool
+{
+public:
+    TTwoLevelFairShareThreadPool(
+        TThreadPoolIOEngineConfigPtr config,
+        const TString& locationId,
+        NLogging::TLogger logger)
+        : PoolWeights_(New<TTwoLevelPoolWeightProvider>(config->PoolWeights))
+        , MainThreadPool_(CreateNewTwoLevelFairShareThreadPool(
+            config->ReadThreadCount + config->AuxThreadCount + config->FsyncThreadCount,
+            Format("TLFairLoc:%v", locationId),
+            {
+                PoolWeights_,
+                true // TODO change to false verbose logging
+            }))
+        , Logger(logger)
+        , BucketCache_(New<TBucketCache>(config->BucketTtl, logger))
+    { }
+
+    IInvokerPtr GetReadInvoker(const TWorkloadDescriptor& workloadDescriptor, const TSessionId& sessionId)
+    {
+        const auto& poolName = ToString(workloadDescriptor.Category);
+        const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
+        const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        YT_LOG_DEBUG("Getting read bucket for disk (Category: %v, Bucket: %v, Weight: %v)", poolName, bucketTag, bucketWeight);
+        return BucketCache_->Get(MainThreadPool_, poolName, bucketTag, bucketWeight);
+    }
+
+    IInvokerPtr GetWriteInvoker(const TWorkloadDescriptor& workloadDescriptor, const TSessionId& sessionId)
+    {
+        const auto& poolName = ToString(workloadDescriptor.Category);
+        const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
+        const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        YT_LOG_DEBUG("Getting write bucket for disk (Category: %v, Bucket: %v, Weight: %v)", poolName, bucketTag, bucketWeight);
+        return BucketCache_->Get(MainThreadPool_, poolName, bucketTag, bucketWeight);
+    }
+
+    IInvokerPtr GetInvoker(const TWorkloadDescriptor& workloadDescriptor, const TSessionId& sessionId)
+    {
+        const auto& poolName = ToString(workloadDescriptor.Category);
+        const auto& bucketTag = GetBucketTag(workloadDescriptor, sessionId);
+        const auto bucketWeight = GetBucketWeight(workloadDescriptor);
+        YT_LOG_DEBUG("Getting bucket for disk (Category: %v, Bucket: %v, Weight: %v)", poolName, bucketTag, bucketWeight);
+        return BucketCache_->Get(MainThreadPool_, poolName, bucketTag, bucketWeight);
+    }
+
+    void Reconfigure(const TThreadPoolIOEngineConfigPtr& config)
+    {
+        PoolWeights_->Configure(config->PoolWeights);
+        MainThreadPool_->Configure(config->ReadThreadCount + config->AuxThreadCount + config->FsyncThreadCount);
+    }
+
+private:
+    TString GetBucketTag(const TWorkloadDescriptor& workloadDescriptor, const TSessionId& sessionId) {
+        if (workloadDescriptor.DiskFairShareBucketTag) {
+            return *workloadDescriptor.DiskFairShareBucketTag;
+        } else if (sessionId) {
+            return ToString(sessionId);
+        }
+        return ToString(sessionId);
+    }
+
+    double GetBucketWeight(const TWorkloadDescriptor& workloadDescriptor) {
+        if (workloadDescriptor.DiskFairShareBucketWeight && *workloadDescriptor.DiskFairShareBucketWeight > 0) {
+            return *workloadDescriptor.DiskFairShareBucketWeight;
+        } else {
+            return 1.0;
+        }
+    }
+
+private:
+    TIntrusivePtr<TTwoLevelPoolWeightProvider> PoolWeights_;
+    const ITwoLevelFairShareThreadPoolPtr MainThreadPool_;
+    const NLogging::TLogger Logger;
+    TIntrusivePtr<TBucketCache> BucketCache_;
+};
+
 template <typename TThreadPool, typename TRequestSlicer>
 class TThreadPoolIOEngine
     : public TIOEngineBase
@@ -285,22 +468,23 @@ public:
             std::move(profiler),
             std::move(logger))
         , StaticConfig_(std::move(config))
+        , MainThreadPool_(StaticConfig_, LocationId_, Logger)
         , Config_(StaticConfig_)
-        , ThreadPool_(StaticConfig_, LocationId_, Logger)
         , RequestSlicer_(StaticConfig_->DesiredRequestSize, StaticConfig_->MinRequestSize)
     { }
 
     TFuture<TReadResponse> Read(
         std::vector<TReadRequest> requests,
-        EWorkloadCategory category,
+        const TWorkloadDescriptor& descriptor,
         TRefCountedTypeCookie tagCookie,
-        TSessionId sessionId,
+        const TSessionId& sessionId,
         bool useDedicatedAllocations) override
     {
+        YT_LOG_DEBUG("TThreadPoolIOEngine Read");
         std::vector<TFuture<void>> futures;
         futures.reserve(requests.size());
 
-        auto invoker = ThreadPool_.GetReadInvoker(category, sessionId);
+        auto invoker = MainThreadPool_.GetReadInvoker(descriptor, sessionId);
 
         i64 paddedBytes = 0;
         for (const auto& request : requests) {
@@ -316,7 +500,7 @@ public:
                         std::move(slice.Request),
                         std::move(slice.OutputBuffer),
                         TWallTimer(),
-                        category,
+                        descriptor,
                         sessionId)
                     .AsyncVia(invoker)
                     .Run());
@@ -337,15 +521,16 @@ public:
 
     TFuture<void> Write(
         TWriteRequest request,
-        EWorkloadCategory category,
-        TSessionId sessionId) override
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
     {
+        YT_LOG_DEBUG("TThreadPoolIOEngine Write");
         YT_ASSERT(request.Handle);
         std::vector<TFuture<void>> futures;
         for (auto& slice : RequestSlicer_.Slice(std::move(request))) {
             futures.push_back(
                 BIND(&TThreadPoolIOEngine::DoWrite, MakeStrong(this), std::move(slice), TWallTimer())
-                .AsyncVia(ThreadPool_.GetWriteInvoker(category, sessionId))
+                .AsyncVia(MainThreadPool_.GetWriteInvoker(descriptor, sessionId))
                 .Run());
         }
         return AllSucceeded(std::move(futures));
@@ -353,33 +538,37 @@ public:
 
     TFuture<void> FlushFile(
         TFlushFileRequest request,
-        EWorkloadCategory category) override
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
     {
+        YT_LOG_DEBUG("TThreadPoolIOEngine FlushFile");
         return BIND(&TThreadPoolIOEngine::DoFlushFile, MakeStrong(this), std::move(request))
-            .AsyncVia(ThreadPool_.GetWriteInvoker(category, {}))
+            .AsyncVia(MainThreadPool_.GetWriteInvoker(descriptor, sessionId))
             .Run();
     }
 
     virtual TFuture<void> FlushFileRange(
         TFlushFileRangeRequest request,
-        EWorkloadCategory category,
-        TSessionId sessionId) override
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
     {
+        YT_LOG_DEBUG("TThreadPoolIOEngine FlushFileRange");
         std::vector<TFuture<void>> futures;
         for (auto& slice : RequestSlicer_.Slice(std::move(request))) {
             futures.push_back(
                 BIND(&TThreadPoolIOEngine::DoFlushFileRange, MakeStrong(this), std::move(slice))
-                .AsyncVia(ThreadPool_.GetWriteInvoker(category, sessionId))
+                .AsyncVia(MainThreadPool_.GetWriteInvoker(descriptor, sessionId))
                 .Run());
         }
         return AllSucceeded(std::move(futures));
     }
 
-private:
+protected:
     const TConfigPtr StaticConfig_;
-    TAtomicIntrusivePtr<TConfig> Config_;
+    TThreadPool MainThreadPool_;
 
-    TThreadPool ThreadPool_;
+private:
+    TAtomicIntrusivePtr<TConfig> Config_;
     TRequestSlicer RequestSlicer_;
 
 
@@ -437,8 +626,8 @@ private:
         const TReadRequest& request,
         TMutableRef buffer,
         TWallTimer timer,
-        EWorkloadCategory category,
-        TSessionId sessionId)
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId)
     {
         YT_VERIFY(std::ssize(buffer) == request.Size);
 
@@ -450,7 +639,7 @@ private:
         auto fileOffset = request.Offset;
         i64 bufferOffset = 0;
 
-        YT_LOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive,
+        YT_LOG_DEBUG_IF(descriptor.Category == EWorkloadCategory::UserInteractive,
             "Started reading from disk (Handle: %v, RequestSize: %v, ReadSessionId: %v, ReadWaitTime: %v)",
             static_cast<FHANDLE>(*request.Handle),
             request.Size,
@@ -469,7 +658,7 @@ private:
                     NTracing::TNullTraceContextGuard nullTraceContextGuard;
                     reallyRead = HandleEintr(::pread, *request.Handle, buffer.Begin() + bufferOffset, toRead, fileOffset);
 
-                    YT_LOG_DEBUG_IF(category == EWorkloadCategory::UserInteractive,
+                    YT_LOG_DEBUG_IF(descriptor.Category == EWorkloadCategory::UserInteractive,
                         "Finished reading from disk (Handle: %v, ReadBytes: %v, ReadSessionId: %v, ReadTime: %v)",
                         static_cast<FHANDLE>(*request.Handle),
                         reallyRead,
@@ -730,8 +919,100 @@ private:
     {
         auto config = UpdateYsonStruct(StaticConfig_, node);
 
-        ThreadPool_.Reconfigure(config);
+        MainThreadPool_.Reconfigure(config);
         Config_.Store(config);
+    }
+};
+
+//! Previous IO engines separate load across 3 ThreadPools: ReadWrite, Aux, Fsync. This IO engine uses one fair threadpool.
+class TTwoLevelFairShareThreadPoolIOEngine
+    : public TThreadPoolIOEngine<TTwoLevelFairShareThreadPool, TIORequestSlicer>
+{
+public:
+    TTwoLevelFairShareThreadPoolIOEngine(
+        TConfigPtr config,
+        TString locationId,
+        TProfiler profiler,
+        NLogging::TLogger logger)
+        : TThreadPoolIOEngine(
+            config,
+            std::move(locationId),
+            std::move(profiler),
+            std::move(logger))
+    { }
+
+    TFuture<TIOEngineHandlePtr> Open(
+        TOpenRequest request,
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine Open");
+        return BIND(&TTwoLevelFairShareThreadPoolIOEngine::DoOpen, MakeStrong(this), std::move(request))
+            .AsyncVia(MainThreadPool_.GetInvoker(descriptor, sessionId))
+            .Run();
+    }
+
+    TFuture<void> Close(
+        TCloseRequest request,
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine Close");
+        return BIND(&TTwoLevelFairShareThreadPoolIOEngine::DoClose, MakeStrong(this), std::move(request))
+            .AsyncVia(MainThreadPool_.GetInvoker(descriptor, sessionId))
+            .Run();
+    }
+
+    TFuture<void> FlushDirectory(
+        TFlushDirectoryRequest request,
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine FlushDirectory");
+        return BIND(&TTwoLevelFairShareThreadPoolIOEngine::DoFlushDirectory, MakeStrong(this), std::move(request))
+            .AsyncVia(MainThreadPool_.GetInvoker(descriptor, sessionId))
+            .Run();
+    }
+
+    TFuture<void> Allocate(
+        TAllocateRequest request,
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine Allocate");
+        return BIND(&TTwoLevelFairShareThreadPoolIOEngine::DoAllocate, MakeStrong(this), std::move(request))
+            .AsyncVia(MainThreadPool_.GetInvoker(descriptor, sessionId))
+            .Run();
+    }
+
+    TFuture<void> Lock(
+        TLockRequest request,
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine Lock");
+        return BIND(&TTwoLevelFairShareThreadPoolIOEngine::DoLock, MakeStrong(this), std::move(request))
+            .AsyncVia(MainThreadPool_.GetInvoker(descriptor, sessionId))
+            .Run();
+    }
+
+    TFuture<void> Resize(
+        TResizeRequest request,
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine Resize");
+        return BIND(&TTwoLevelFairShareThreadPoolIOEngine::DoResize, MakeStrong(this), std::move(request))
+            .AsyncVia(MainThreadPool_.GetInvoker(descriptor, sessionId))
+            .Run();
+    }
+
+    IInvokerPtr GetAuxPoolInvoker(
+        const TWorkloadDescriptor& descriptor,
+        const TSessionId& sessionId) override
+    {
+        YT_LOG_DEBUG("TTwoLevelFairShareThreadPoolIOEngine GetAuxPoolInvoker");
+        return MainThreadPool_.GetInvoker(descriptor, sessionId);
     }
 };
 
@@ -770,6 +1051,13 @@ IIOEnginePtr CreateIOEngine(
                 std::move(locationId),
                 std::move(profiler),
                 std::move(logger));
+        case NYT::NIO::EIOEngineType::TwoLevelFairShareThreadPool:
+            return CreateIOEngine<TTwoLevelFairShareThreadPoolIOEngine>(
+                std::move(ioConfig),
+                std::move(locationId),
+                std::move(profiler),
+                std::move(logger)
+            );
         default:
             THROW_ERROR_EXCEPTION("Unknown IO engine %Qlv",
                 engineType);

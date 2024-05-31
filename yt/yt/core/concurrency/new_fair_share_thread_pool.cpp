@@ -303,12 +303,14 @@ struct TBucketBase
     TExecutionPoolPtr Pool = nullptr;
 
     TCpuDuration ExcessTime = 0;
+    double InverseWeight = 1.0;
 
     TEnqueuedTime EnqueuedTime;
 
-    TBucketBase(TString bucketName, TString poolName)
+    TBucketBase(TString bucketName, TString poolName, double bucketWeight = 1.0)
         : BucketName(std::move(bucketName))
         , PoolName(std::move(poolName))
+        , InverseWeight(1.0 / bucketWeight)
     { }
 };
 
@@ -325,8 +327,8 @@ class TBucket
     , public TBucketBase
 {
 public:
-    TBucket(TString bucketName, TString poolName, TBucketMappingPtr parent)
-        : TBucketBase(std::move(bucketName), std::move(poolName))
+    TBucket(TString bucketName, TString poolName, TBucketMappingPtr parent, double bucketWeight)
+        : TBucketBase(std::move(bucketName), std::move(poolName), bucketWeight)
         , Parent_(std::move(parent))
     { }
 
@@ -413,7 +415,7 @@ public:
     virtual void Invoke(TClosure callback, TBucket* bucket) = 0;
 
     // GetInvoker is protected by mapping lock (can be sharded).
-    IInvokerPtr GetInvoker(const TString& poolName, const TString& bucketName)
+    IInvokerPtr GetInvoker(const TString& poolName, const TString& bucketName, double bucketWeight)
     {
         // TODO(lukyan): Use reader guard and update it to writer if needed.
         auto guard = Guard(MappingLock_);
@@ -422,7 +424,7 @@ public:
 
         auto bucket = bucketIt->second ? DangerousGetPtr(bucketIt->second) : nullptr;
         if (!bucket) {
-            bucket = New<TBucket>(bucketName, poolName, MakeStrong(this));
+            bucket = New<TBucket>(bucketName, poolName, MakeStrong(this), bucketWeight);
             bucketIt->second = bucket.Get();
             bucket->Pool = GetOrRegisterPool(bucket->PoolName);
         }
@@ -892,14 +894,16 @@ private:
             pool->InverseWeight = 1.0 / PoolWeightProvider_->GetWeight(pool->PoolName);
         }
 
-        YT_LOG_DEBUG_IF(VerboseLogging_, "Increment excess time (BucketName: %v, PoolName: %v, ExcessTime: %v -> %v)",
+        YT_LOG_DEBUG_IF(VerboseLogging_, "Increment excess time (BucketName: %v, PoolName: %v, ExcessTime: %v -> %v, Duration: %v, InverseWeight: %v)",
             bucket->BucketName,
             bucket->PoolName,
             bucket->ExcessTime,
-            bucket->ExcessTime + duration);
+            bucket->ExcessTime + duration * bucket->InverseWeight,
+            duration,
+            bucket->InverseWeight);
 
         pool->ExcessTime += duration * pool->InverseWeight;
-        bucket->ExcessTime += duration;
+        bucket->ExcessTime += duration * bucket->InverseWeight;
 
         if (auto* positionInHeap = pool->GetPositionInHeap()) {
             ActivePoolsHeap_.AdjustDown(pool);
@@ -1261,10 +1265,11 @@ public:
 
     IInvokerPtr GetInvoker(
         const TString& poolName,
-        const TFairShareThreadPoolTag& bucketName) override
+        const TFairShareThreadPoolTag& bucketName,
+        double bucketWeight) override
     {
         EnsureStarted();
-        return Queue_->GetInvoker(poolName, bucketName);
+        return Queue_->GetInvoker(poolName, bucketName, bucketWeight);
     }
 
     void Shutdown() override

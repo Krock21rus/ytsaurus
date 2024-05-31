@@ -26,7 +26,8 @@ struct ITwoLevelFairShareThreadPool
 
     virtual IInvokerPtr GetInvoker(
         const TString& poolName,
-        const TFairShareThreadPoolTag& tag) = 0;
+        const TFairShareThreadPoolTag& tag,
+        double bucketWeight = 1.0) = 0;
 
     virtual void Shutdown() = 0;
 
