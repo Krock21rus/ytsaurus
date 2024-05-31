@@ -70,7 +70,7 @@ void TChunkFileWriter::TryLockDataFile(TPromise<void> promise)
     TDelayedExecutor::Submit(
         BIND(&TChunkFileWriter::TryLockDataFile, MakeStrong(this), promise),
         TDuration::MilliSeconds(10),
-        IOEngine_->GetAuxPoolInvoker());
+        IOEngine_->GetAuxPoolInvoker(EWorkloadCategory::UserInteractive, {})); // TODO what can we pass here
 }
 
 void TChunkFileWriter::SetFailed(const TError& error)
@@ -105,7 +105,7 @@ TFuture<void> TChunkFileWriter::Open()
 
     // NB: Races are possible between file creation and a call to flock.
     // Unfortunately in Linux we can't create'n'flock a file atomically.
-    return IOEngine_->Open({FileName_ + NFS::TempFileSuffix, FileMode})
+    return IOEngine_->Open({FileName_ + NFS::TempFileSuffix, FileMode}, EWorkloadCategory::UserInteractive, {}) // TODO what descriptor and sessionId can we pass here
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TIOEngineHandlePtr& file) {
             YT_VERIFY(State_.load() == EState::Opening);
 
@@ -114,7 +114,7 @@ TFuture<void> TChunkFileWriter::Open()
             auto promise = NewPromise<void>();
             TryLockDataFile(promise);
             return promise.ToFuture();
-        }).AsyncVia(IOEngine_->GetAuxPoolInvoker()))
+        }).AsyncVia(IOEngine_->GetAuxPoolInvoker(EWorkloadCategory::UserInteractive, {}))) // TODO what can we pass here
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TError& error) {
             YT_VERIFY(State_.load() == EState::Opening);
 
@@ -187,7 +187,7 @@ bool TChunkFileWriter::WriteBlocksWithSession(
             std::move(buffers),
             SyncOnClose_
         },
-        workloadDescriptor.Category,
+        workloadDescriptor,
         sessionId)
         .Apply(BIND([=, this, this_ = MakeStrong(this), newDataSize = currentOffset] (const TError& error) {
             YT_VERIFY(State_.load() == EState::WritingBlocks);
@@ -233,7 +233,7 @@ TFuture<void> TChunkFileWriter::CloseWithSession(
     }
 
     auto metaFileName = FileName_ + ChunkMetaSuffix;
-    return IOEngine_->Close({std::move(DataFile_), DataSize_, SyncOnClose_})
+    return IOEngine_->Close({std::move(DataFile_), DataSize_, SyncOnClose_}, workloadDescriptor, sessionId)
         .Apply(BIND([=, this, this_ = MakeStrong(this)] {
             YT_VERIFY(State_.load() == EState::Closing);
 
@@ -247,7 +247,8 @@ TFuture<void> TChunkFileWriter::CloseWithSession(
             ChunkMeta_->CopyFrom(*chunkMeta);
             SetProtoExtension(ChunkMeta_->mutable_extensions(), BlocksExt_);
 
-            return IOEngine_->Open({metaFileName + NFS::TempFileSuffix, FileMode});
+YT_LOG_DEBUG("Initially closed a chunk, opening");
+            return IOEngine_->Open({metaFileName + NFS::TempFileSuffix, FileMode}, workloadDescriptor, sessionId);
         }))
         .Apply(BIND([=, this, this_ = MakeStrong(this)] (const TIOEngineHandlePtr& chunkMetaFile) {
             YT_VERIFY(State_.load() == EState::Closing);
@@ -268,6 +269,7 @@ TFuture<void> TChunkFileWriter::CloseWithSession(
             ::memcpy(buffer.Begin(), &header, sizeof(header));
             ::memcpy(buffer.Begin() + sizeof(header), metaData.Begin(), metaData.Size());
 
+YT_LOG_DEBUG("Opened a chunk, writing and closing");
             return
                 IOEngine_->Write({
                     chunkMetaFile,
@@ -275,17 +277,19 @@ TFuture<void> TChunkFileWriter::CloseWithSession(
                     {std::move(buffer)},
                     SyncOnClose_
                 },
-                workloadDescriptor.Category,
+                workloadDescriptor,
                 sessionId)
                 .Apply(BIND(&IIOEngine::Close, IOEngine_, IIOEngine::TCloseRequest{
                     std::move(chunkMetaFile),
                     MetaDataSize_,
                     SyncOnClose_
                 },
-                workloadDescriptor.Category));
+                workloadDescriptor,
+                sessionId));
         }))
         .Apply(BIND([=, this, this_ = MakeStrong(this)] {
             YT_VERIFY(State_.load() == EState::Closing);
+YT_LOG_DEBUG("Wrote and closed a chunk");
 
             NFS::Rename(metaFileName + NFS::TempFileSuffix, metaFileName);
             NFS::Rename(FileName_ + NFS::TempFileSuffix, FileName_);
@@ -293,9 +297,10 @@ TFuture<void> TChunkFileWriter::CloseWithSession(
             if (!SyncOnClose_) {
                 return VoidFuture;
             }
+YT_LOG_DEBUG("Doing FlushDirectory for a chunk");
 
-            return IOEngine_->FlushDirectory({NFS::GetDirectoryName(FileName_)});
-        }).AsyncVia(IOEngine_->GetAuxPoolInvoker()))
+            return IOEngine_->FlushDirectory({NFS::GetDirectoryName(FileName_)}, workloadDescriptor, sessionId);
+        }).AsyncVia(IOEngine_->GetAuxPoolInvoker(workloadDescriptor, sessionId)))
         .Apply(BIND([this, _this = MakeStrong(this)] (const TError& error) {
             YT_VERIFY(State_.load() == EState::Closing);
 
@@ -306,6 +311,7 @@ TFuture<void> TChunkFileWriter::CloseWithSession(
                     << error;
             }
 
+YT_LOG_DEBUG("Flushed a chunk, success");
             ChunkInfo_.set_disk_space(DataSize_ + MetaDataSize_);
             State_.store(EState::Closed);
         }));
@@ -345,7 +351,7 @@ TFuture<void> TChunkFileWriter::Cancel()
 
             State_.store(EState::Aborted);
         })
-        .AsyncVia(IOEngine_->GetAuxPoolInvoker())
+        .AsyncVia(IOEngine_->GetAuxPoolInvoker(EWorkloadCategory::UserInteractive, {})) // TODO what can we pass here
         .Run();
 }
 
