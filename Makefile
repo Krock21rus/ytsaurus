@@ -115,7 +115,7 @@ DOCKER_REGISTRY = localhost:${REGISTRY_LOCAL_PORT}
 DOCKER_REPOSITORY = ${USER}
 
 ## Docker image suffix.
-DOCKER_IMAGE_SUFFIX = -relwithdebinfo
+DOCKER_IMAGE_SUFFIX = -relwithdebinfo-fairio-3
 
 ## Target docker image tag, default {branch}-{date}-{commit}.
 DOCKER_IMAGE_TAG = $(shell git branch --show-current | tr / -)-$(shell git show -s --pretty=%cs-%H)${DOCKER_IMAGE_SUFFIX}
@@ -271,7 +271,7 @@ hack-local-python: ## Fix for USE_LOCAL_PYTHON in multiarch distro for docker bu
 # https://distribution.github.io/distribution/about/configuration/
 
 ## Port for local docker registry.
-REGISTRY_LOCAL_PORT = 5000
+REGISTRY_LOCAL_PORT = 5001
 REGISTRY_LOCAL_NAME = ${USER}-registry-localhost-${REGISTRY_LOCAL_PORT}
 
 docker-run-local-registry: ## Run local docker registry.
