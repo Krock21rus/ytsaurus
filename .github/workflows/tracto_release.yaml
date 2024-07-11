@@ -1,0 +1,25 @@
+name: Release TractoAI YTsaurus image
+on:
+  workflow_dispatch:
+  push:
+      branches:
+        - mirror-ytsaurus/releases/private/stable/23.2
+
+env:
+  DOCKER_REGISTRY: cr.ai.nebius.cloud
+  DOCKER_REPOSITORY: crnf2coti090683j5ssi
+
+jobs:
+  release-image:
+    runs-on: tractoai-runners
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Login to Nemax docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}
+          username: json_key
+          password: ${{ secrets.GH_RUNNER_NEMAX_SA_KEY_JSON }}
+      - name: Build image and push to registry
+        run: YAPACKAGE_MODE=push make release-image
