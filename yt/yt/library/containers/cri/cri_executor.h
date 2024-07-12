@@ -64,6 +64,19 @@ struct TCriBindMount
     bool ReadOnly;
 };
 
+DEFINE_BIT_ENUM(ECriBindDevicePermissions,
+    ((Read)   (0x01))
+    ((Write)  (0x02))
+    ((Create) (0x04))
+);
+struct TCriBindDevice
+{
+    TString ContainerPath;
+    TString HostPath;
+
+    ECriBindDevicePermissions Permissions;
+};
+
 struct TCriCredentials
 {
     std::optional<i64> Uid;
@@ -84,6 +97,8 @@ struct TCriContainerSpec
 
     std::vector<TCriBindMount> BindMounts;
 
+    std::vector<TCriBindDevice> BindDevices;
+
     TCriCredentials Credentials;
 
     TCriContainerResources Resources;
@@ -99,6 +114,9 @@ struct TCriContainerSpec
 
     //! Environment variable to set in the container.
     THashMap<TString, TString> Environment;
+
+    //! Capabilities to add to the container.
+    std::vector<TString> CapabilitiesToAdd;
 };
 
 DEFINE_REFCOUNTED_TYPE(TCriContainerSpec)
