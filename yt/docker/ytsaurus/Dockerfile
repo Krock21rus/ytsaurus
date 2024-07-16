@@ -21,6 +21,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install 
   curl \
   dnsutils \
   gdb \
+  iproute2 \
   iputils-ping \
   less \
   libidn11-dev \
