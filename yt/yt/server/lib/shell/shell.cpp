@@ -7,10 +7,13 @@
 
 #endif
 
+#include <yt/yt/server/lib/user_job/config.h>
+
 #include <yt/yt/server/tools/proc.h>
 #include <yt/yt/server/tools/public.h>
 #include <yt/yt/server/tools/tools.h>
 
+#include <yt/yt/library/process/process.h>
 #include <yt/yt/library/process/pty.h>
 
 #include <yt/yt/core/actions/bind.h>
@@ -48,15 +51,14 @@ static const i64 InputOffsetWarningLevel = 65536;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-class TShell
+
+class TShellBase
     : public IShell
 {
 public:
-    TShell(
-        IPortoExecutorPtr portoExecutor,
+    TShellBase(
         std::unique_ptr<TShellOptions> options)
-        : PortoExecutor_(std::move(portoExecutor))
-        , Options_(std::move(options))
+        : Options_(std::move(options))
         , Id_(Options_->Id)
         , Index_(Options_->Index)
         , CurrentHeight_(Options_->Height)
@@ -68,6 +70,103 @@ public:
 
         Logger.AddTag("ShellId: %v, ShellIndex: %v", Id_, Index_);
     }
+
+    void ResizeWindow(int height, int width) override
+    {
+        VERIFY_THREAD_AFFINITY(ControlThread);
+
+        if (CurrentHeight_ != height || CurrentWidth_ != width) {
+            SafeSetTtyWindowSize(Reader_->GetHandle(), height, width);
+            CurrentHeight_ = height;
+            CurrentWidth_ = width;
+        }
+    }
+
+    TFuture<TSharedRef> Poll() override
+    {
+        VERIFY_THREAD_AFFINITY(ControlThread);
+
+        return ConcurrentReader_->Read()
+            .WithTimeout(PollTimeout);
+    }
+
+    TShellId GetId() const override
+    {
+        return Id_;
+    }
+
+    int GetIndex() const override
+    {
+        return Index_;
+    }
+
+    void Terminate(const TError& error) override
+    {
+        VERIFY_THREAD_AFFINITY(ControlThread);
+
+        if (!IsRunning_) {
+            return;
+        }
+        IsRunning_ = false;
+
+        TDelayedExecutor::CancelAndClear(InactivityCookie_);
+        YT_UNUSED_FUTURE(Writer_->Abort());
+        if (Instance_) {
+            Instance_->Destroy();
+        }
+        Reader_->SetReadDeadline(TInstant::Now() + TerminatedShellReadTimeout);
+        TerminatedPromise_.TrySet();
+        YT_LOG_INFO(error, "Shell terminated");
+    }
+
+    bool Terminated() const override
+    {
+        return TerminatedPromise_.IsSet();
+    }
+
+protected:
+    const std::unique_ptr<TShellOptions> Options_;
+    const TShellId Id_;
+    const int Index_;
+    int CurrentHeight_;
+    int CurrentWidth_;
+
+    IInstancePtr Instance_;
+
+    bool IsRunning_ = false;
+
+    IConnectionWriterPtr Writer_;
+    IAsyncZeroCopyOutputStreamPtr ZeroCopyWriter_;
+    ui64 ConsumedOffset_ = 0;
+
+    IConnectionReaderPtr Reader_;
+    IAsyncZeroCopyInputStreamPtr ConcurrentReader_;
+
+    TInstant LastActivity_ = TInstant::Now();
+    TDuration InactivityTimeout_;
+    TDelayedExecutorCookie InactivityCookie_;
+    TError InactivityError_;
+    TPromise<void> TerminatedPromise_ = NewPromise<void>();
+
+    std::optional<TString> Command_;
+
+    NLogging::TLogger Logger = ShellLogger;
+
+    std::unique_ptr<TPty> Pty_;
+
+    DECLARE_THREAD_AFFINITY_SLOT(ControlThread);
+};
+
+class TPortoShell
+    : public TShellBase
+{
+public:
+    TPortoShell(
+        IPortoExecutorPtr portoExecutor,
+        std::unique_ptr<TShellOptions> options)
+        : TShellBase(std::move(options))
+        , PortoExecutor_(std::move(portoExecutor))
+    { }
 
     void Spawn()
     {
@@ -189,23 +288,191 @@ public:
 
         Instance_->Wait()
             .Subscribe(
-                BIND(&TShell::Terminate, MakeWeak(this))
+                BIND(&TPortoShell::Terminate, MakeWeak(this))
                     .Via(GetCurrentInvoker()));
         YT_LOG_INFO("Shell started");
     }
 
-    void ResizeWindow(int height, int width) override
+    ui64 SendKeys(const TSharedRef& keys, ui64 inputOffset) override
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
-        if (CurrentHeight_ != height || CurrentWidth_ != width) {
-            SafeSetTtyWindowSize(Reader_->GetHandle(), height, width);
-            CurrentHeight_ = height;
-            CurrentWidth_ = width;
+        if (ConsumedOffset_ < inputOffset) {
+            // Key sequence from the future is not possible.
+            THROW_ERROR_EXCEPTION("Input offset is more than consumed offset")
+                << TErrorAttribute("expected_input_offset", ConsumedOffset_)
+                << TErrorAttribute("actual_input_offset", inputOffset);
         }
+
+        if (inputOffset + InputOffsetWarningLevel < ConsumedOffset_) {
+            YT_LOG_WARNING(
+                "Input offset is significantly less than consumed offset (InputOffset: %v, ConsumedOffset: %v)",
+                ConsumedOffset_,
+                inputOffset);
+        }
+
+        size_t offset = ConsumedOffset_ - inputOffset;
+        if (offset < keys.Size()) {
+            ConsumedOffset_ += keys.Size() - offset;
+            WaitFor(ZeroCopyWriter_->Write(keys.Slice(offset, keys.Size())))
+                .ThrowOnError();
+
+            LastActivity_ = TInstant::Now();
+            if (InactivityCookie_) {
+                TDelayedExecutor::CancelAndClear(InactivityCookie_);
+                InactivityCookie_ = TDelayedExecutor::Submit(
+                    BIND(&TPortoShell::Terminate, MakeWeak(this), InactivityError_)
+                        .Via(GetCurrentInvoker()),
+                    InactivityTimeout_);
+            }
+        }
+        return ConsumedOffset_;
     }
 
-    ui64 SendKeys(const TSharedRef& keys, ui64 inputOffset) override
+    TFuture<void> Shutdown(const TError& error) override
+    {
+        VERIFY_THREAD_AFFINITY(ControlThread);
+
+        if (IsRunning_ && !InactivityCookie_) {
+            auto delay = InactivityTimeout_;
+            InactivityError_ = error;
+            InactivityCookie_ = TDelayedExecutor::Submit(
+                BIND(&TPortoShell::Terminate, MakeWeak(this), InactivityError_)
+                    .Via(GetCurrentInvoker()),
+                delay);
+        }
+        return TerminatedPromise_;
+    }
+
+private:
+    const IPortoExecutorPtr PortoExecutor_;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+IShellPtr CreatePortoShell(
+    NContainers::IPortoExecutorPtr portoExecutor,
+    std::unique_ptr<TShellOptions> options)
+{
+    auto shell = New<TPortoShell>(std::move(portoExecutor), std::move(options));
+    shell->Spawn();
+    return shell;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+class TShell
+    : public TShellBase
+{
+public:
+    explicit TShell(std::unique_ptr<TShellOptions> options)
+        : TShellBase(std::move(options))
+        , Process_(New<TSimpleProcess>(Options_->ExePath, false))
+    { }
+
+    void Spawn()
+    {
+        VERIFY_THREAD_AFFINITY(ControlThread);
+
+        YT_VERIFY(!IsRunning_);
+        IsRunning_ = true;
+
+        int uid = Options_->Uid.value_or(::getuid());
+        auto user = SafeGetUsernameByUid(uid);
+        auto home = Options_->WorkingDir;
+
+        YT_LOG_INFO("Spawning TTY (Term: %v, Height: %v, Width: %v, Uid: %v, Username: %v, Home: %v, InactivityTimeout: %v, Command: %v)",
+            Options_->Term,
+            CurrentHeight_,
+            CurrentWidth_,
+            uid,
+            user,
+            home,
+            InactivityTimeout_,
+            Command_);
+
+        TPty pty(CurrentHeight_, CurrentWidth_);
+
+        Reader_ = pty.CreateMasterAsyncReader();
+        auto bufferingReader = CreateBufferingAdapter(Reader_, ReaderBufferSize);
+        auto expiringReader = CreateExpiringAdapter(bufferingReader, PollTimeout);
+        ConcurrentReader_ = CreateConcurrentAdapter(expiringReader);
+
+        Writer_ = pty.CreateMasterAsyncWriter();
+        ZeroCopyWriter_ = CreateZeroCopyAdapter(Writer_);
+
+        Process_->SetWorkingDirectory(home);
+
+        if (Options_->MessageOfTheDay) {
+            auto path = NFS::CombinePaths(home, ".motd");
+
+            try {
+                TFile file(path, CreateAlways | WrOnly | Seq | CloseOnExec);
+                TUnbufferedFileOutput output(file);
+                output.Write(*Options_->MessageOfTheDay);
+            } catch (const std::exception& ex) {
+                THROW_ERROR_EXCEPTION("Error saving shell message file")
+                    << ex
+                    << TErrorAttribute("path", path);
+            }
+        }
+        if (Options_->Bashrc) {
+            auto path = NFS::CombinePaths(home, ".bashrc");
+
+            try {
+                TFile file(path, CreateAlways | WrOnly | Seq | CloseOnExec);
+                TUnbufferedFileOutput output(file);
+                output.Write(*Options_->Bashrc);
+            } catch (const std::exception& ex) {
+                THROW_ERROR_EXCEPTION("Error saving shell config file")
+                    << ex
+                    << TErrorAttribute("path", path);
+            }
+        }
+
+        {
+            auto executorConfig = New<NUserJob::TUserJobExecutorConfig>();
+
+            if (Options_->Command) {
+                executorConfig->Command = *Options_->Command;
+            }
+
+            executorConfig->Pty = pty.GetSlaveFD();
+            executorConfig->Environment.reserve(Options_->Environment.size() + 6);
+
+            executorConfig->Environment.push_back("HOME=" + home);
+            executorConfig->Environment.push_back("LOGNAME=" + user);
+            executorConfig->Environment.push_back("USER=" + user);
+            executorConfig->Environment.push_back("TERM=" + Options_->Term);
+            executorConfig->Environment.push_back("LANG=en_US.UTF-8");
+            executorConfig->Environment.push_back("YT_SHELL_ID=" + ToString(Id_));
+
+            for (const auto& var : Options_->Environment) {
+                executorConfig->Environment.push_back(var);
+            }
+
+            executorConfig->StderrPath = Format("../stderr.%v", Id_);
+            auto executorConfigPath = NFS::CombinePaths(home, Format("../executor.%v.yson", Id_));
+
+            try {
+                TFile configFile(executorConfigPath, CreateAlways | WrOnly | Seq | CloseOnExec);
+                TUnbufferedFileOutput output(configFile);
+                NYson::TYsonWriter writer(&output, NYson::EYsonFormat::Pretty);
+                Serialize(executorConfig, &writer);
+                writer.Flush();
+            } catch (const std::exception& ex) {
+                THROW_ERROR_EXCEPTION("Failed to write executor config into %v", executorConfigPath) << ex;
+            }
+
+            Process_->AddArguments({"--config", executorConfigPath});
+        }
+        ResizeWindow(CurrentHeight_, CurrentWidth_);
+        Process_->Spawn().Subscribe(BIND(&TShell::Terminate, MakeWeak(this)).Via(GetCurrentInvoker()));
+        YT_LOG_INFO("Shell started");
+
+    }
+
+    virtual ui64 SendKeys(const TSharedRef& keys, ui64 inputOffset) override
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
@@ -241,32 +508,7 @@ public:
         return ConsumedOffset_;
     }
 
-    TFuture<TSharedRef> Poll() override
-    {
-        VERIFY_THREAD_AFFINITY(ControlThread);
-
-        return ConcurrentReader_->Read()
-            .WithTimeout(PollTimeout);
-    }
-
-    void Terminate(const TError& error) override
-    {
-        VERIFY_THREAD_AFFINITY(ControlThread);
-
-        if (!IsRunning_) {
-            return;
-        }
-        IsRunning_ = false;
-
-        TDelayedExecutor::CancelAndClear(InactivityCookie_);
-        YT_UNUSED_FUTURE(Writer_->Abort());
-        Instance_->Destroy();
-        Reader_->SetReadDeadline(TInstant::Now() + TerminatedShellReadTimeout);
-        TerminatedPromise_.TrySet();
-        YT_LOG_INFO(error, "Shell terminated");
-    }
-
-    TFuture<void> Shutdown(const TError& error) override
+    virtual TFuture<void> Shutdown(const TError& error) override
     {
         VERIFY_THREAD_AFFINITY(ControlThread);
 
@@ -281,71 +523,34 @@ public:
         return TerminatedPromise_;
     }
 
-    TShellId GetId() const override
-    {
-        return Id_;
-    }
-
-    int GetIndex() const override
-    {
-        return Index_;
-    }
-
-    bool Terminated() const override
-    {
-        return TerminatedPromise_.IsSet();
-    }
-
 private:
-    const IPortoExecutorPtr PortoExecutor_;
-    const std::unique_ptr<TShellOptions> Options_;
-    const TShellId Id_;
-    const int Index_;
-    int CurrentHeight_;
-    int CurrentWidth_;
+    const TProcessBasePtr Process_;
 
-    IInstancePtr Instance_;
-
-    bool IsRunning_ = false;
-
-    IConnectionWriterPtr Writer_;
-    IAsyncZeroCopyOutputStreamPtr ZeroCopyWriter_;
-    ui64 ConsumedOffset_ = 0;
-
-    IConnectionReaderPtr Reader_;
-    IAsyncZeroCopyInputStreamPtr ConcurrentReader_;
-
-    TInstant LastActivity_ = TInstant::Now();
-    TDuration InactivityTimeout_;
-    TDelayedExecutorCookie InactivityCookie_;
-    TError InactivityError_;
-    TPromise<void> TerminatedPromise_ = NewPromise<void>();
-
-    std::optional<TString> Command_;
-
-    NLogging::TLogger Logger = ShellLogger;
-
-    std::unique_ptr<TPty> Pty_;
-
-    DECLARE_THREAD_AFFINITY_SLOT(ControlThread);
+    void CleanupShellProcesses()
+    {
+        YT_UNUSED_FUTURE(Reader_->Abort());
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 
-IShellPtr CreateShell(
-    NContainers::IPortoExecutorPtr portoExecutor,
-    std::unique_ptr<TShellOptions> options)
+IShellPtr CreateShell(std::unique_ptr<TShellOptions> options)
 {
-    auto shell = New<TShell>(std::move(portoExecutor), std::move(options));
+    auto shell = New<TShell>(std::move(options));
     shell->Spawn();
     return shell;
 }
 
 #else
 
-IShellPtr CreateShell(
+IShellPtr CreatePortoShell(
     NContainers::IPortoExecutorPtr /*portoExecutor*/,
     std::unique_ptr<TShellOptions> /*options*/)
+{
+    THROW_ERROR_EXCEPTION("Shell is supported only under Unix");
+}
+
+IShellPtr CreateShell(std::unique_ptr<TShellOptions> /*options*/)
 {
     THROW_ERROR_EXCEPTION("Shell is supported only under Unix");
 }

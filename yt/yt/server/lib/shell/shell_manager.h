@@ -10,11 +10,10 @@
 
 #include <yt/yt/core/actions/future.h>
 
-#include <yt/yt/core/misc/intrusive_ptr.h>
-
 #include <yt/yt/core/yson/string.h>
 
 #include <library/cpp/yt/memory/ref.h>
+#include <library/cpp/yt/memory/intrusive_ptr.h>
 
 #include <optional>
 
@@ -53,10 +52,12 @@ DEFINE_REFCOUNTED_TYPE(IShellManager)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-IShellManagerPtr CreateShellManager(
+IShellManagerPtr CreatePortoShellManager(
     const TShellManagerConfig& config,
     NContainers::IPortoExecutorPtr portoExecutor,
     NContainers::IInstancePtr rootInstance);
+
+IShellManagerPtr CreateShellManager(const TShellManagerConfig& config);
 
 ////////////////////////////////////////////////////////////////////////////////
 
