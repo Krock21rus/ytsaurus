@@ -101,12 +101,12 @@ void TExecProgram::DoRun(const NLastGetopt::TOptsParseResult& /*parseResult*/)
     try {
         OpenExecutorStderr();
     } catch (const std::exception& ex) {
-        Exit(ToUnderlying(EProgramExitCode::ExecutorStderrOpenError));
+        Exit(17);
     }
 
     if (!executorError.IsOK()) {
         LogToStderr(Format("Failed to prepare pipes, unexpected executor error\n%v\n", executorError));
-        Exit(ToUnderlying(EProgramExitCode::ExecutorError));
+        Exit(4);
     }
 
     // NB: intentionally open executor_stderr after processing pipes to avoid fd clashes.
@@ -117,7 +117,23 @@ void TExecProgram::DoRun(const NLastGetopt::TOptsParseResult& /*parseResult*/)
             ExecutorStderr_ = newFile;
         }
     } catch (const std::exception& ex) {
-        Exit(ToUnderlying(EProgramExitCode::ExecutorStderrDuplicateError));
+        Exit(18);
+    }
+
+    if (config->Pty) {
+        CloseAllDescriptors({*config->Pty});
+        if (setsid() == -1) {
+            THROW_ERROR_EXCEPTION("Failed to create a new session") << TError::FromSystem();
+        }
+        if (::ioctl(*config->Pty, TIOCSCTTY, 1) == -1) {
+            THROW_ERROR_EXCEPTION("Failed to set controlling pseudoterminal") << TError::FromSystem();
+        }
+        SafeDup2(*config->Pty, 0);
+        SafeDup2(*config->Pty, 1);
+        SafeDup2(*config->Pty, 2);
+        if (*config->Pty > 2) {
+            SafeClose(*config->Pty);
+        }
     }
 
     std::vector<const char*> env;
@@ -140,12 +156,15 @@ void TExecProgram::DoRun(const NLastGetopt::TOptsParseResult& /*parseResult*/)
     args.push_back(nullptr);
 
     // We are ready to execute user code, send signal to JobProxy.
-    try {
-        auto jobProxyControl = CreateUserJobSynchronizerClient(config->UserJobSynchronizerConnectionConfig);
-        jobProxyControl->NotifyExecutorPrepared();
-    } catch (const std::exception& ex) {
-        LogToStderr(Format("Unable to notify job proxy\n%v", ex.what()));
-        Exit(ToUnderlying(EProgramExitCode::JobProxyNotificationError));
+    // Config is absent for job shell.
+    if (const auto& userJobSynchronizerConnectionConfig = config->UserJobSynchronizerConnectionConfig) {
+        try {
+            auto jobProxyControl = CreateUserJobSynchronizerClient(userJobSynchronizerConnectionConfig);
+            jobProxyControl->NotifyExecutorPrepared();
+        } catch (const std::exception& ex) {
+            LogToStderr(Format("Unable to notify job proxy\n%v", ex.what()));
+            Exit(5);
+        }
     }
 
     TryExecve(
@@ -154,7 +173,7 @@ void TExecProgram::DoRun(const NLastGetopt::TOptsParseResult& /*parseResult*/)
         env.data());
 
     LogToStderr(Format("execve failed: %v", TError::FromSystem()));
-    Exit(ToUnderlying(EProgramExitCode::ExecveError));
+    Exit(6);
 }
 
 void TExecProgram::OnError(const TString& message) noexcept
