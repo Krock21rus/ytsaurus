@@ -2779,6 +2779,7 @@ TJobProxyInternalConfigPtr TJob::CreateConfig()
         proxyConfig->ForceIdleCpuPolicy = proxyDynamicConfig->ForceIdleCpuPolicy;
         proxyConfig->AbortOnUncaughtException = proxyDynamicConfig->AbortOnUncaughtException;
         proxyConfig->EnableStderrAndCoreLivePreview = proxyDynamicConfig->EnableStderrAndCoreLivePreview;
+        proxyConfig->CheckUserJobOOMKill = proxyDynamicConfig->CheckUserJobOOMKill;
         if (proxyDynamicConfig->JobEnvironment) {
             proxyConfig->JobEnvironment = PatchNode(proxyConfig->JobEnvironment, proxyDynamicConfig->JobEnvironment);
         }
@@ -3191,6 +3192,11 @@ std::optional<EAbortReason> TJob::DeduceAbortReason()
                     }
                     break;
                 }
+            }
+        }
+        if (auto processSignal = resultError.FindMatching(EProcessErrorCode::Signal)) {
+            if (processSignal->Attributes().Find<bool>("oom_killed").value_or(false)) {
+                return EAbortReason::ResourceOverdraft;
             }
         }
     }
