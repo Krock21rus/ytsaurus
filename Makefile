@@ -3,8 +3,14 @@
 # If you update this file, please follow
 # https://www.thapaliya.com/en/writings/well-documented-makefiles/
 
-# Put your targets and default options into "Makefile.inc"
-include $(wildcard Makefile.inc)
+# Put your local targets and default options into "Makefile.inc" or "Local.mk"
+include $(wildcard Makefile.inc Local.mk)
+
+# Put branch-specific targets into "Branch.mk"
+include $(wildcard Branch.mk)
+
+# Put docker-specific targets into "Docker.mk"
+include $(wildcard Docker.mk)
 
 .DEFAULT_GOAL := help
 
@@ -103,49 +109,13 @@ ifneq (${TEST_FILTER},)
 endif
 
 ## All reasonable non-broken target directories.
-ALL_DIRS ?= yt/yt/ yt/yt_proto/ yt/chyt/ yt/yql/ yt/python/ yt/go/ yt/odin/
+ALL_DIRS ?= yt/yt/ yt/yt_proto/ yt/cpp/ yt/chyt/ yt/yql/ yt/python/ yt/go/ yt/odin/
 
 YAMAKE_FLAGS += ${BUILD_FLAGS}
 
 ifneq (${TEST},)
   YAMAKE_FLAGS += ${TEST_FLAGS}
 endif
-
-## Docker registry for local builds.
-DOCKER_REGISTRY ?= localhost:${REGISTRY_LOCAL_PORT}
-
-## Docker image path.
-DOCKER_REPOSITORY ?= ${USER}
-
-## Docker image suffix.
-DOCKER_IMAGE_SUFFIX ?= -local
-
-## Target docker image tag, default {branch}-{date}-{commit}.
-DOCKER_IMAGE_TAG ?= $(shell git branch --show-current | tr / -)-$(shell git show -s --pretty=%cs-%H)${DOCKER_IMAGE_SUFFIX}
-
-DOCKER_OVERRIDE_BASE_REPOSITORY ?= ghcr.io/ytsaurus/ytsaurus
-DOCKER_OVERRIDE_BASE_IMAGE ?= stable-23.2.0-relwithdebinfo
-
-ifeq (${YAPACKAGE_MODE}, push)
-  YAPACKAGE_FLAGS += --docker-push
-endif
-ifneq (${DOCKER_REGISTRY},)
-  YAPACKAGE_FLAGS += --docker-registry ${DOCKER_REGISTRY}
-endif
-ifneq (${DOCKER_REPOSITORY},)
-  YAPACKAGE_FLAGS += --docker-repository ${DOCKER_REPOSITORY}
-endif
-ifneq (${DOCKER_IMAGE_TAG},)
-  YAPACKAGE_FLAGS += --custom-version ${DOCKER_IMAGE_TAG}
-endif
-
-ifneq (${DOCKER_OVERRIDE_BASE_REPOSITORY},)
-  DOCKER_OVERRIDE_FLAGS += --docker-build-arg BASE_REPOSITORY=${DOCKER_OVERRIDE_BASE_REPOSITORY}
-endif
-ifneq (${DOCKER_OVERRIDE_BASE_IMAGE},)
-  DOCKER_OVERRIDE_FLAGS += --docker-build-arg BASE_IMAGE=${DOCKER_OVERRIDE_BASE_IMAGE}
-endif
-
 
 CMAKE = cmake
 
@@ -172,93 +142,6 @@ help:  # Display this help
 	@${print_help} 'TEST=failed'		'Run failed tests.'
 	@${print_help} 'TEST=debug'		'Debug failed tests.'
 	@${print_help} 'TEST_FILTER=<mask>'	'Filter tests by name.'
-
-##@ Releases:
-
-YT_VERSION ?= 23.2
-
-BRANCH_STABLE_BASE = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\1/stable/\4#')
-REMOTE_BOOTSTRAP_BRANCH = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\1/\2/patches/bootstrap/stable/\4#')
-LOCAL_BOOTSTRAP_BRANCH = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\2/patches/bootstrap/stable/\4#')
-PUBLIC_RELEASE_BRANCH = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\2/releases/public/stable/\4#')
-PRIVATE_RELEASE_BRANCH = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\2/releases/private/stable/\4#')
-BRANCH_FRAGMENT_PUBLIC_PREFIXES = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\1/\2/patches/public/stable/\4#')
-BRANCH_FRAGMENT_PRIVATE_PREFIXES = $(shell git rev-parse --symbolic-full-name @{u} | sed -E 's#(refs/remotes/[^/]+)/([^/]+)/(.*)/stable/([^/]+)(.*)#\1/\2/patches/private/stable/\4#')
-BRANCH_PUBLIC_FRAGMENTS=$(shell git for-each-ref --sort="-authordate" "--format=%(refname)" ${BRANCH_FRAGMENT_PUBLIC_PREFIXES})
-BRANCH_PRIVATE_FRAGMENTS=$(shell git for-each-ref --sort="-authordate" "--format=%(refname)" ${REMOTE_BOOTSTRAP_BRANCH}  ${BRANCH_FRAGMENT_PRIVATE_PREFIXES})
-
-checkout-bootstrap-branch: ## Checkout bootstrap branch for the current release.
-	git diff --quiet
-	git diff --quiet --cached
-	git checkout ${LOCAL_BOOTSTRAP_BRANCH}
-
-checkout-public-release-branch: ## Checkout public release branch for the current release.
-	git diff --quiet
-	git diff --quiet --cached
-	git checkout ${PUBLIC_RELEASE_BRANCH}
-
-checkout-release-branch: ## Checkout (private) release branch for the current release.
-	git diff --quiet
-	git diff --quiet --cached
-	git checkout ${PRIVATE_RELEASE_BRANCH}
-
-rebuild-public-release-branch: checkout-public-release-branch ## Rebuild public release branch by resetting it to the corresponding stable branch and cherry-picking fragments from mirror-ytsaurus/patches/public/stable/version/*.
-	git reset --hard ${BRANCH_STABLE_BASE}
-	if [ ! -z "${BRANCH_PUBLIC_FRAGMENTS}" ]; then git cherry-pick -x --keep-redundant-commits ${BRANCH_PUBLIC_FRAGMENTS} --not HEAD; fi
-
-rebuild-private-release-branch: checkout-release-branch ## Rebuild private release branch by resetting it to the current public release branch and cherry-picking fragments from mirror-ytsaurus/patches/private/stable/version/*.
-	git reset --hard ${PUBLIC_RELEASE_BRANCH}
-	if [ ! -z "${BRANCH_PRIVATE_FRAGMENTS}" ]; then git cherry-pick -x --keep-redundant-commits ${BRANCH_PRIVATE_FRAGMENTS} --not HEAD; fi
-
-rebuild-release-branch: rebuild-public-release-branch rebuild-private-release-branch ## Rebuild release branch by first rebuilding the public release branch on top of the corresponding stable branch and then rebuilding the private branch on top of the resulting public release branch.
-
-push-public-release-branch: ## Push public release branch.
-	git push -f origin ${PUBLIC_RELEASE_BRANCH}
-
-push-private-release-branch: TAG_NAME=tracto-${YT_VERSION}-$(shell git show -s --pretty=%cs-%H ${PRIVATE_RELEASE_BRANCH})
-push-private-release-branch: ## Push private release branch with corresponding tag.
-	git tag -a ${TAG_NAME} -m "YTsaurus tracto ${YT_VERSION} release" ${PRIVATE_RELEASE_BRANCH}
-	git push -f origin ${PRIVATE_RELEASE_BRANCH}
-	git push origin ${TAG_NAME}
-
-push-release-branches: push-public-release-branch push-private-release-branch ## Push public and private release branches with corresponding tags. Should start CI.
-
-release-image: DOCKER_IMAGE_TAG=tracto-${YT_VERSION}-$(shell git show -s --pretty=%cs-%H)
-release-image: DOCKER_OVERRIDE_BASE_REPOSITORY=ghcr.io/ytsaurus/ytsaurus-nightly
-# It is best to change this image to the most recent completed 23.2 build every release.
-release-image: DOCKER_OVERRIDE_BASE_IMAGE=dev-23.2-2024-07-08-367bed7c0d74d5cec0def1499c02e72890d97ce2-relwithdebinfo
-release-image: docker-ytsaurus-override ## Build release docker image and push to nemax registry.
-
-##@ Docker:
-
-docker-ytsaurus-override: ## Override ytsaurus server in docker image.
-	$(YATOOL) package ${YAPACKAGE_FLAGS} ${DOCKER_OVERRIDE_FLAGS} yt/docker/ya-build/ytsaurus-server-override/package.json
-	@cat packages.json
-
-# /usr/include/pythonX/pyconfig.h cannot include ARCH/pythonX/pyconfig.h without -I/usr/include
-# Add symlink /usr/include/pythonX/ARCH/pythonX -> /usr/include/ARCH/pythonX
-hack-local-python: I=$(shell python3-config --includes | sed -n 's/^-I\(\S\+\) .*/\1/p')
-hack-local-python: A=$(shell dpkg-architecture -q DEB_BUILD_MULTIARCH)
-hack-local-python: ## Fix for USE_LOCAL_PYTHON in multiarch distro for docker build.
-	mkdir -p ${I}/${A}
-	ln -s ../../${A}/$(notdir ${I}) ${I}/${A}
-
-
-# https://distribution.github.io/distribution/about/configuration/
-
-## Port for local docker registry.
-REGISTRY_LOCAL_PORT ?= 5000
-REGISTRY_LOCAL_NAME ?= ${USER}-registry-localhost-${REGISTRY_LOCAL_PORT}
-
-docker-run-local-registry: ## Run local docker registry.
-	docker run --name ${REGISTRY_LOCAL_NAME} -d --restart=always \
-		--mount type=volume,src=${REGISTRY_LOCAL_NAME},dst=/var/lib/registry \
-		-p "127.0.0.1:${REGISTRY_LOCAL_PORT}:5000" \
-		registry:2
-
-docker-rm-local-registry: ## Remove local docker registry.
-	docker rm -f ${REGISTRY_LOCAL_NAME}
-	docker volume rm -f ${REGISTRY_LOCAL_NAME}
 
 ##@ Devel:
 
@@ -357,21 +240,6 @@ clean-build-cache: ## Clean build cache.
 
 clean-tools-cache: ## Clean tools cache.
 	rm -fr ${HOME}/.ya/tools
-
-clean-docker:
-	docker container prune --force
-	docker volume prune --force --all
-	docker image prune --force --all
-	docker builder prune --force --all
-	docker system prune --force --all
-
-export CONTAINERD_NAMESPACE=k8s.io
-clean-containerd-containers:
-	ctr task ls -q | xargs -r ctr task rm -f
-	ctr container ls -q | xargs -r ctr container rm
-
-clean-containerd-images:
-	ctr image prune --all
 
 build-cache-size: ## Get build cache size limit.
 	@echo $$(( $$( $(YATOOL) gen-config | sed -nE 's/^(# )?cache_size = ([0-9]*)/\2/p') >> 30 )) GiB
