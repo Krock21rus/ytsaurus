@@ -35,6 +35,10 @@ endif
 
 ##@ Docker:
 
+docker-ytsaurus: ## Build release docker image.
+	$(YATOOL) package ${YAPACKAGE_FLAGS} yt/docker/ya-build/ytsaurus/package.json
+	@cat packages.json
+
 docker-ytsaurus-override: ## Override ytsaurus server in docker image.
 	$(YATOOL) package ${YAPACKAGE_FLAGS} ${DOCKER_OVERRIDE_FLAGS} yt/docker/ya-build/ytsaurus-server-override/package.json
 	@cat packages.json
@@ -44,9 +48,7 @@ docker-ytsaurus-override: ## Override ytsaurus server in docker image.
 hack-local-python: I=$(shell python3-config --includes | sed -n 's/^-I\(\S\+\) .*/\1/p')
 hack-local-python: A=$(shell dpkg-architecture -q DEB_BUILD_MULTIARCH)
 hack-local-python: ## Fix for USE_LOCAL_PYTHON in multiarch distro for docker build.
-	mkdir -p ${I}/${A}
-	ln -s ../../${A}/$(notdir ${I}) ${I}/${A}
-
+	if [ ! -e ${I}/${A} ]; then sudo mkdir -p ${I}/${A} && sudo ln -s ../../${A}/$(notdir ${I}) ${I}/${A}; fi
 
 # https://distribution.github.io/distribution/about/configuration/
 
