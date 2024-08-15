@@ -23,3 +23,9 @@ compile_commands.json
 .idea
 .vscode
 .DS_Store
+
+test-results
+
+# local makefiles
+/Makefile.inc
+/Local.mk
