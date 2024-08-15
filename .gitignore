@@ -27,5 +27,5 @@ compile_commands.json
 test-results
 
 # local makefiles
-Makefile.inc
-Local.mk
+/Makefile.inc
+/Local.mk
