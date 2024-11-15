@@ -1,5 +1,5 @@
 #include "two_level_fair_share_thread_pool.h"
-#include "new_fair_share_thread_pool.h"
+#include "new_new_fair_share_thread_pool.h"
 #include "private.h"
 #include "notify_manager.h"
 #include "profiling_helpers.h"
@@ -220,6 +220,7 @@ struct TAction
 {
     TCpuInstant EnqueuedAt = 0;
     TCpuInstant StartedAt = 0;
+    TCpuInstant ExpectedBytes = 0;
 
     // Callback keeps raw ptr to bucket to minimize bucket ref count.
     TClosure Callback;
@@ -303,12 +304,14 @@ struct TBucketBase
     TExecutionPoolPtr Pool = nullptr;
 
     TCpuDuration ExcessTime = 0;
+    double InverseWeight = 1.0;
 
     TEnqueuedTime EnqueuedTime;
 
-    TBucketBase(TString bucketName, TString poolName)
+    TBucketBase(TString bucketName, TString poolName, double bucketWeight = 1.0)
         : BucketName(std::move(bucketName))
         , PoolName(std::move(poolName))
+        , InverseWeight(1.0 / bucketWeight)
     { }
 };
 
@@ -320,13 +323,13 @@ bool operator < (const TBucketBase& lhs, const TBucketBase& rhs)
 ////////////////////////////////////////////////////////////////////////////////
 
 class TBucket
-    : public IInvoker
+    : public IInvokerWithExpectedBytes
     , public THeapItemBase<TBucket>
     , public TBucketBase
 {
 public:
-    TBucket(TString bucketName, TString poolName, TBucketMappingPtr parent)
-        : TBucketBase(std::move(bucketName), std::move(poolName))
+    TBucket(TString bucketName, TString poolName, TBucketMappingPtr parent, double bucketWeight)
+        : TBucketBase(std::move(bucketName), std::move(poolName), bucketWeight)
         , Parent_(std::move(parent))
     { }
 
@@ -350,6 +353,15 @@ public:
     {
         for (auto& callback : callbacks) {
             Invoke(std::move(callback));
+        }
+    }
+
+    void InvokeWithExpectedBytes(TClosure callback, i64 expectedBytes) override;
+
+    void InvokeWithExpectedBytes(TMutableRange<std::pair<TClosure, i64>> callbacks) override
+    {
+        for (auto& callback : callbacks) {
+            InvokeWithExpectedBytes(std::move(callback.first), std::move(callback.second));
         }
     }
 
@@ -410,10 +422,10 @@ public:
 
     virtual TProfiler GetPoolProfiler(const TString& poolName) = 0;
 
-    virtual void Invoke(TClosure callback, TBucket* bucket) = 0;
+    virtual void Invoke(TClosure callback, i64 expectedBytes, TBucket* bucket) = 0;
 
     // GetInvoker is protected by mapping lock (can be sharded).
-    IInvokerPtr GetInvoker(const TString& poolName, const TString& bucketName)
+    IInvokerWithExpectedBytesPtr GetInvoker(const TString& poolName, const TString& bucketName, double bucketWeight)
     {
         // TODO(lukyan): Use reader guard and update it to writer if needed.
         auto guard = Guard(MappingLock_);
@@ -422,7 +434,7 @@ public:
 
         auto bucket = bucketIt->second ? DangerousGetPtr(bucketIt->second) : nullptr;
         if (!bucket) {
-            bucket = New<TBucket>(bucketName, poolName, MakeStrong(this));
+            bucket = New<TBucket>(bucketName, poolName, MakeStrong(this), bucketWeight);
             bucketIt->second = bucket.Get();
             bucket->Pool = GetOrRegisterPool(bucket->PoolName);
         }
@@ -567,7 +579,12 @@ DEFINE_REFCOUNTED_TYPE(TBucketMapping)
 
 void TBucket::Invoke(TClosure callback)
 {
-    Parent_->Invoke(std::move(callback), this);
+    Parent_->Invoke(std::move(callback), 0, this);
+}
+
+void TBucket::InvokeWithExpectedBytes(TClosure callback, i64 expectedBytes)
+{
+    Parent_->Invoke(std::move(callback), expectedBytes, this);
 }
 
 TBucket::~TBucket()
@@ -593,7 +610,7 @@ public:
     TTwoLevelFairShareQueue(
         TIntrusivePtr<NThreading::TEventCount> callbackEventCount,
         const TString& threadNamePrefix,
-        const TNewTwoLevelFairShareThreadPoolOptions& options)
+        const TNewNewTwoLevelFairShareThreadPoolOptions& options)
         : TNotifyManager(std::move(callbackEventCount), GetThreadTags(threadNamePrefix), options.PollingPeriod)
         , TBucketMapping(options.PoolRetentionTime)
         , ThreadNamePrefix_(threadNamePrefix)
@@ -617,7 +634,7 @@ public:
     }
 
     // Invoke is lock free.
-    void Invoke(TClosure callback, TBucket* bucket) override
+    void Invoke(TClosure callback, i64 expectedBytes, TBucket* bucket) override
     {
         if (Stopped_.load()) {
             return;
@@ -631,6 +648,7 @@ public:
 
         TAction action;
         action.EnqueuedAt = cpuInstant;
+        action.ExpectedBytes = expectedBytes;
         // Callback keeps raw ptr to bucket to minimize bucket ref count.
         action.Callback = BIND(&TBucket::RunCallback, Unretained(bucket), std::move(callback), cpuInstant);
         action.BucketHolder = MakeStrong(bucket);
@@ -892,14 +910,16 @@ private:
             pool->InverseWeight = 1.0 / PoolWeightProvider_->GetWeight(pool->PoolName);
         }
 
-        YT_LOG_DEBUG_IF(VerboseLogging_, "Increment excess time (BucketName: %v, PoolName: %v, ExcessTime: %v -> %v)",
+        YT_LOG_DEBUG_IF(VerboseLogging_, "Increment excess time (BucketName: %v, PoolName: %v, ExcessTime: %v -> %v, Duration: %v, InverseWeight: %v)",
             bucket->BucketName,
             bucket->PoolName,
             bucket->ExcessTime,
-            bucket->ExcessTime + duration);
+            bucket->ExcessTime + duration * bucket->InverseWeight,
+            duration,
+            bucket->InverseWeight);
 
         pool->ExcessTime += duration * pool->InverseWeight;
-        bucket->ExcessTime += duration;
+        bucket->ExcessTime += duration * bucket->InverseWeight;
 
         if (auto* positionInHeap = pool->GetPositionInHeap()) {
             ActivePoolsHeap_.AdjustDown(pool);
@@ -994,7 +1014,9 @@ private:
             if (auto* bucket = threadState.Action.BucketHolder.Get()) {
 
                 // TODO(lukyan): Update last excess time for pool without active buckets.
-                UpdateExcessTime(bucket, currentInstant - threadState.AccountedAt, currentInstant);
+                auto bytesConsumed = threadState.Action.ExpectedBytes;
+                threadState.Action.ExpectedBytes = 0;
+                UpdateExcessTime(bucket, bytesConsumed, currentInstant);
                 threadState.AccountedAt = currentInstant;
             }
 
@@ -1232,14 +1254,14 @@ DEFINE_REFCOUNTED_TYPE(TFairShareThread)
 ////////////////////////////////////////////////////////////////////////////////
 
 class TTwoLevelFairShareThreadPool
-    : public ITwoLevelFairShareThreadPool
+    : public INewNewTwoLevelFairShareThreadPool
     , public TThreadPoolBase
 {
 public:
     TTwoLevelFairShareThreadPool(
         int threadCount,
         const TString& threadNamePrefix,
-        const TNewTwoLevelFairShareThreadPoolOptions& options)
+        const TNewNewTwoLevelFairShareThreadPoolOptions& options)
         : TThreadPoolBase(threadNamePrefix)
         , Queue_(New<TTwoLevelFairShareQueue>(
             CallbackEventCount_,
@@ -1261,10 +1283,20 @@ public:
 
     IInvokerPtr GetInvoker(
         const TString& poolName,
-        const TFairShareThreadPoolTag& bucketName) override
+        const TFairShareThreadPoolTag& bucketName,
+        double bucketWeight) override
     {
         EnsureStarted();
-        return Queue_->GetInvoker(poolName, bucketName);
+        return Queue_->GetInvoker(poolName, bucketName, bucketWeight);
+    }
+
+    IInvokerWithExpectedBytesPtr GetInvokerWithExpectedBytes(
+        const TString& poolName,
+        const TFairShareThreadPoolTag& bucketName,
+        double bucketWeight) override
+    {
+        EnsureStarted();
+        return Queue_->GetInvoker(poolName, bucketName, bucketWeight);
     }
 
     void Shutdown() override
@@ -1320,10 +1352,10 @@ private:
 
 ////////////////////////////////////////////////////////////////////////////////
 
-ITwoLevelFairShareThreadPoolPtr CreateNewTwoLevelFairShareThreadPool(
+INewNewTwoLevelFairShareThreadPoolPtr CreateNewNewTwoLevelFairShareThreadPool(
     int threadCount,
     const TString& threadNamePrefix,
-    const TNewTwoLevelFairShareThreadPoolOptions& options)
+    const TNewNewTwoLevelFairShareThreadPoolOptions& options)
 {
     return New<TTwoLevelFairShareThreadPool>(
         threadCount,
